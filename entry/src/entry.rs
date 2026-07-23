@@ -4,6 +4,8 @@
 //! represents an approximate amount of time since the last Entry was created.
 use {
     crate::poh::Poh,
+    agave_transaction_view::transaction_view::SanitizedTransactionView,
+    bytes::Bytes,
     crossbeam_channel::{Receiver, Sender},
     log::*,
     rayon::{ThreadPool, prelude::*},
@@ -41,7 +43,7 @@ pub type MaxDataShredsLen = BincodeLen<MAX_DATA_SHREDS_SIZE>;
 /// hash was computed by the world's fastest processor at that time. The hash chain is both
 /// a Verifiable Delay Function (VDF) and a Proof of Work (not to be confused with Proof of
 /// Work consensus!)
-#[derive(Debug, Default, PartialEq, Eq, Clone, SchemaWrite, SchemaRead)]
+#[derive(Debug, PartialEq, Eq, Clone, SchemaWrite, SchemaRead)]
 pub struct Entry {
     /// The number of hashes since the previous Entry ID.
     pub num_hashes: u64,
@@ -52,8 +54,17 @@ pub struct Entry {
     /// An ordered list of transactions that were observed before the Entry ID was
     /// generated. They may have been observed before a previous Entry ID but were
     /// pushed back into this list to ensure deterministic interpretation of the ledger.
-    #[wincode(with = "WincodeVec<VersionedTransaction, MaxDataShredsLen>")]
-    pub transactions: Vec<VersionedTransaction>,
+    #[wincode(with = "WincodeVec<SanitizedTransactionView<Bytes>, MaxDataShredsLen>")]
+    pub transactions: Vec<SanitizedTransactionView<Bytes>>,
+}
+
+impl Default for Entry {
+    fn default() -> Self {
+        todo!(
+            "what even is a default Entry?. Probably should 
+            have been a test only target, and renamed to Entry::bogus_entry()."
+        )
+    }
 }
 
 // The data needed to verify an Entry.
@@ -74,7 +85,7 @@ impl From<&Entry> for EntryVerificationData {
             signatures: entry
                 .transactions
                 .iter()
-                .flat_map(|tx| tx.signatures.iter().copied())
+                .flat_map(|tx| tx.signatures().iter().copied())
                 .collect(),
         }
     }
@@ -211,7 +222,7 @@ pub struct ValidatedHashedTransactions<Tx: TransactionWithMeta> {
 
 impl Entry {
     /// Creates the next Entry `num_hashes` after `start_hash`.
-    pub fn new(prev_hash: &Hash, mut num_hashes: u64, transactions: Vec<Transaction>) -> Self {
+    pub fn new(prev_hash: &Hash, mut num_hashes: u64, transactions: Vec<TrSansaction>) -> Self {
         // If you passed in transactions, but passed in num_hashes == 0, then
         // next_hash will generate the next hash and set num_hashes == 1
         if num_hashes == 0 && !transactions.is_empty() {
