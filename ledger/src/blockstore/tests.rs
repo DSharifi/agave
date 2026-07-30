@@ -10,7 +10,7 @@ use {
     },
     assert_matches::assert_matches,
     rand::{rng, seq::SliceRandom},
-    solana_entry::entry::next_entry_mut,
+    solana_entry::entry::{next_entry_mut, versioned_transaction_from_view},
     solana_genesis_utils::{MAX_GENESIS_ARCHIVE_UNPACKED_SIZE, open_genesis_config},
     solana_hash::Hash,
     solana_message::{compiled_instruction::CompiledInstruction, v0::LoadedAddresses},
@@ -2792,13 +2792,13 @@ fn test_get_rooted_block() {
         .map(|transaction| {
             let mut pre_balances: Vec<u64> = vec![];
             let mut post_balances: Vec<u64> = vec![];
-            for i in 0..transaction.message.static_account_keys().len() {
+            for i in 0..transaction.static_account_keys().len() {
                 pre_balances.push(i as u64 * 10);
                 post_balances.push(i as u64 * 11);
             }
             let compute_units_consumed = Some(12345);
             let cost_units = Some(6789);
-            let signature = transaction.signatures[0];
+            let signature = transaction.signatures()[0];
             let status = TransactionStatusMeta {
                 status: Ok(()),
                 fee: 42,
@@ -2860,7 +2860,7 @@ fn test_get_rooted_block() {
                 .put_protobuf((signature, slot + 2), &status)
                 .unwrap();
             VersionedTransactionWithStatusMeta {
-                transaction,
+                transaction: versioned_transaction_from_view(&transaction),
                 meta: TransactionStatusMeta {
                     status: Ok(()),
                     fee: 42,
@@ -3713,7 +3713,7 @@ fn test_get_rooted_transaction() {
         .map(|transaction| {
             let mut pre_balances: Vec<u64> = vec![];
             let mut post_balances: Vec<u64> = vec![];
-            for i in 0..transaction.message.static_account_keys().len() {
+            for i in 0..transaction.static_account_keys().len() {
                 pre_balances.push(i as u64 * 10);
                 post_balances.push(i as u64 * 11);
             }
@@ -3728,7 +3728,7 @@ fn test_get_rooted_transaction() {
             let pre_token_balances = Some(vec![]);
             let post_token_balances = Some(vec![]);
             let rewards = Some(vec![]);
-            let signature = transaction.signatures[0];
+            let signature = transaction.signatures()[0];
             let return_data = Some(TransactionReturnData {
                 program_id: Pubkey::new_unique(),
                 data: vec![1, 2, 3],
@@ -3754,7 +3754,7 @@ fn test_get_rooted_transaction() {
                 .put_protobuf((signature, slot), &status)
                 .unwrap();
             VersionedTransactionWithStatusMeta {
-                transaction,
+                transaction: versioned_transaction_from_view(&transaction),
                 meta: TransactionStatusMeta {
                     status: Ok(()),
                     fee: 42,
@@ -3838,7 +3838,7 @@ fn test_get_complete_transaction() {
         .map(|transaction| {
             let mut pre_balances: Vec<u64> = vec![];
             let mut post_balances: Vec<u64> = vec![];
-            for i in 0..transaction.message.static_account_keys().len() {
+            for i in 0..transaction.static_account_keys().len() {
                 pre_balances.push(i as u64 * 10);
                 post_balances.push(i as u64 * 11);
             }
@@ -3857,7 +3857,7 @@ fn test_get_complete_transaction() {
                 program_id: Pubkey::new_unique(),
                 data: vec![1, 2, 3],
             });
-            let signature = transaction.signatures[0];
+            let signature = transaction.signatures()[0];
             let status = TransactionStatusMeta {
                 status: Ok(()),
                 fee: 42,
@@ -3879,7 +3879,7 @@ fn test_get_complete_transaction() {
                 .put_protobuf((signature, slot), &status)
                 .unwrap();
             VersionedTransactionWithStatusMeta {
-                transaction,
+                transaction: versioned_transaction_from_view(&transaction),
                 meta: TransactionStatusMeta {
                     status: Ok(()),
                     fee: 42,
@@ -4077,13 +4077,12 @@ fn test_get_confirmed_signatures_for_address2() {
         let mut counter = 0;
         for entry in entries.into_iter() {
             for transaction in entry.transactions {
-                assert_eq!(transaction.signatures.len(), 1);
+                assert_eq!(transaction.signatures().len(), 1);
                 blockstore
                     .write_transaction_status(
                         slot,
-                        transaction.signatures[0],
+                        transaction.signatures()[0],
                         transaction
-                            .message
                             .static_account_keys()
                             .iter()
                             .map(|key| (key, true)),
@@ -4106,13 +4105,12 @@ fn test_get_confirmed_signatures_for_address2() {
         let mut counter = 0;
         for entry in entries.into_iter() {
             for transaction in entry.transactions {
-                assert_eq!(transaction.signatures.len(), 1);
+                assert_eq!(transaction.signatures().len(), 1);
                 blockstore
                     .write_transaction_status(
                         slot,
-                        transaction.signatures[0],
+                        transaction.signatures()[0],
                         transaction
-                            .message
                             .static_account_keys()
                             .iter()
                             .map(|key| (key, true)),

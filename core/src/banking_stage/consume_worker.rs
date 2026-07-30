@@ -1,6 +1,9 @@
 use {
     super::{
-        consumer::{Consumer, ExecuteAndCommitTransactionsOutput, ProcessTransactionBatchOutput},
+        consumer::{
+            Consumer, EntryTransactionProvider, ExecuteAndCommitTransactionsOutput,
+            ProcessTransactionBatchOutput,
+        },
         leader_slot_timing_metrics::LeaderExecuteAndCommitTimings,
         scheduler_messages::{ConsumeWork, FinishedConsumeWork},
     },
@@ -44,7 +47,7 @@ pub(crate) struct ConsumeWorker<Tx> {
     metrics: Arc<ConsumeWorkerMetrics>,
 }
 
-impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
+impl<Tx: TransactionWithMeta + EntryTransactionProvider> ConsumeWorker<Tx> {
     pub fn new(
         id: u32,
         exit: Arc<AtomicBool>,

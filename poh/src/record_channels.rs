@@ -370,12 +370,21 @@ impl BankIdAllowedInsertions {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, solana_hash::Hash, solana_transaction::versioned::VersionedTransaction};
+    use {
+        super::*, solana_entry::entry::transaction_view_from_versioned_transaction,
+        solana_hash::Hash, solana_perf::test_tx::test_tx,
+        solana_transaction::versioned::VersionedTransaction,
+    };
 
     pub(super) fn test_record(bank_id: BankId, num_transactions: usize) -> Record {
         Record {
             bank_id,
-            transactions: vec![VersionedTransaction::default(); num_transactions],
+            transactions: vec![
+                transaction_view_from_versioned_transaction(
+                    &VersionedTransaction::from(test_tx()),
+                );
+                num_transactions
+            ],
             mixin: Hash::default(),
         }
     }

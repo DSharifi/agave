@@ -1,12 +1,10 @@
 use {
     super::{transaction_priority_id::TransactionPriorityId, transaction_state::TransactionState},
     crate::banking_stage::scheduler_messages::TransactionId,
-    agave_transaction_view::resolved_transaction_view::ResolvedTransactionView,
     slab::{Slab, VacantEntry},
-    solana_perf::packet::bytes::Bytes,
     solana_pubkey::{Pubkey, PubkeyHasherBuilder},
     solana_runtime_transaction::{
-        runtime_transaction::RuntimeTransaction, transaction_with_meta::TransactionWithMeta,
+        runtime_transaction::RuntimeTransactionView, transaction_with_meta::TransactionWithMeta,
     },
     std::{
         collections::{BTreeSet, HashMap, hash_map::Entry},
@@ -309,7 +307,6 @@ impl<Tx: TransactionWithMeta> TransactionStateContainer<Tx> {
     }
 }
 
-pub(crate) type RuntimeTransactionView = RuntimeTransaction<ResolvedTransactionView<Bytes>>;
 pub(crate) type TransactionViewState = TransactionState<RuntimeTransactionView>;
 pub(crate) type TransactionViewStateContainer = TransactionStateContainer<RuntimeTransactionView>;
 
@@ -318,12 +315,15 @@ mod tests {
     use {
         super::*,
         crate::banking_stage::scheduler_messages::MaxAge,
-        agave_transaction_view::transaction_view::SanitizedTransactionView,
+        agave_transaction_view::{
+            resolved_transaction_view::ResolvedTransactionView,
+            transaction_view::SanitizedTransactionView,
+        },
         solana_compute_budget_interface::ComputeBudgetInstruction,
         solana_hash::Hash,
         solana_keypair::Keypair,
         solana_message::Message,
-        solana_perf::packet::Packet,
+        solana_perf::packet::{Packet, bytes::Bytes},
         solana_runtime_transaction::{
             runtime_transaction::RuntimeTransaction, sanitize_config::sanitize_config,
         },

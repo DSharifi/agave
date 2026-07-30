@@ -21,14 +21,17 @@ use {
     },
     crossbeam_channel::{Receiver, Sender, select_biased},
     solana_clock::Slot,
-    solana_entry::block_component::{
-        BlockFooterV1, GenesisCertBlockMarker, UpdateParentV1, VersionedBlockMarker,
+    solana_entry::{
+        block_component::{
+            BlockFooterV1, GenesisCertBlockMarker, UpdateParentV1, VersionedBlockMarker,
+        },
+        entry::EntryTransaction,
     },
     solana_gossip::cluster_info::ClusterInfo,
     solana_hash::Hash,
     solana_ledger::{blockstore::Blockstore, leader_schedule_cache::LeaderScheduleCache},
     solana_measure::measure::Measure,
-    solana_perf::packet::{BytesPacket, Meta, PacketBatch, bytes::Bytes},
+    solana_perf::packet::{BytesPacket, Meta, PacketBatch},
     solana_poh::{
         poh_recorder::{GRACE_TICKS_FACTOR, MAX_GRACE_SLOTS, PohRecorder, PohRecorderError},
         record_channels::RecordReceiver,
@@ -44,7 +47,6 @@ use {
         validated_block_finalization::ValidatedBlockFinalizationCert,
         validated_reward_certificate::ValidatedRewardCert,
     },
-    solana_transaction::versioned::VersionedTransaction,
     solana_version::version,
     stats::{LoopMetrics, SlotMetrics},
     std::{
@@ -810,7 +812,7 @@ fn process_parent_ready(
     info: LeaderWindowInfo,
     bank_slot: Slot,
     optimistic_parent: &mut Option<Block>,
-    accumulated_txs: &mut Vec<VersionedTransaction>,
+    accumulated_txs: &mut Vec<EntryTransaction>,
     block_timer: &mut Instant,
     records_shutdown: &mut bool,
 ) -> Result<bool, PohRecorderError> {
@@ -901,7 +903,7 @@ fn handle_parent_ready(
     ctx: &mut LeaderContext,
     leader_window_info: LeaderWindowInfo,
     optimistic_parent_block: Block,
-    mut accumulated_txs: Vec<VersionedTransaction>,
+    mut accumulated_txs: Vec<EntryTransaction>,
     block_timer: &mut Instant,
 ) -> Result<Option<Arc<Bank>>, PohRecorderError> {
     if leader_window_info.parent_block == optimistic_parent_block {
@@ -965,19 +967,11 @@ fn handle_parent_ready(
     // Re-inject accumulated transactions back to banking stage for rescheduling
     let packets: Vec<BytesPacket> = accumulated_txs
         .into_iter()
-        .filter_map(|tx| {
-            let serialized = wincode::serialize(&tx)
-                .inspect_err(|e| {
-                    error!(
-                        "failed to serialize transaction for rescheduling - this should never \
-                         happen: {e:?}"
-                    )
-                })
-                .ok()?;
-            let buffer = Bytes::from(serialized);
+        .map(|tx| {
+            let buffer = tx.inner_data().slice_ref(tx.data());
             let mut meta = Meta::default();
             meta.size = buffer.len();
-            Some(BytesPacket::new(buffer, meta))
+            BytesPacket::new(buffer, meta)
         })
         .collect();
 
@@ -1007,7 +1001,7 @@ fn handle_parent_ready(
 fn shutdown_and_drain_record_receiver(
     poh_recorder: &RwLock<PohRecorder>,
     record_receiver: &mut RecordReceiver,
-    mut accumulated_txs: Option<&mut Vec<VersionedTransaction>>,
+    mut accumulated_txs: Option<&mut Vec<EntryTransaction>>,
 ) -> Result<(), PohRecorderError> {
     record_receiver.shutdown();
 
@@ -1350,7 +1344,11 @@ mod tests {
         agave_banking_stage_ingress_types::BankingPacketReceiver,
         crossbeam_channel::bounded,
         solana_bls_signatures::{BLS_SIGNATURE_AFFINE_SIZE, Signature as BLSSignature},
-        solana_entry::{block_component::VersionedUpdateParent, entry_or_marker::EntryOrMarker},
+        solana_entry::{
+            block_component::VersionedUpdateParent,
+            entry::{transaction_view_from_versioned_transaction, versioned_transaction_from_view},
+            entry_or_marker::EntryOrMarker,
+        },
         solana_keypair::Keypair,
         solana_leader_schedule::{FixedSchedule, LeaderSchedule, SlotLeader},
         solana_ledger::{blockstore::Blockstore, get_tmp_ledger_path_auto_delete},
@@ -1364,17 +1362,19 @@ mod tests {
             installed_scheduler_pool::BankWithScheduler,
         },
         solana_system_transaction as system_transaction,
+        solana_transaction::versioned::VersionedTransaction,
         std::num::NonZeroUsize,
     };
 
-    fn versioned_transfer(lamports: u64) -> VersionedTransaction {
+    fn entry_transfer(lamports: u64) -> EntryTransaction {
         let from = Keypair::new();
-        VersionedTransaction::from(system_transaction::transfer(
+        let transaction = VersionedTransaction::from(system_transaction::transfer(
             &from,
             &Pubkey::new_unique(),
             lamports,
             Hash::new_unique(),
-        ))
+        ));
+        transaction_view_from_versioned_transaction(&transaction)
     }
 
     fn test_genesis_cert_block_marker() -> GenesisCertBlockMarker {
@@ -1770,7 +1770,7 @@ mod tests {
         record_sender
             .try_send(Record::new(
                 Hash::new_unique(),
-                vec![versioned_transfer(1)],
+                vec![entry_transfer(1)],
                 bank_id,
             ))
             .unwrap();
@@ -1878,8 +1878,8 @@ mod tests {
         create_and_insert_leader_bank(leader_slot, optimistic_parent, &mut ctx).unwrap();
         let optimistic_bank_id = ctx.poh_recorder.read().unwrap().bank().unwrap().bank_id();
 
-        let accumulated_tx = versioned_transfer(1);
-        let drained_tx = versioned_transfer(2);
+        let accumulated_tx = entry_transfer(1);
+        let drained_tx = entry_transfer(2);
         record_sender
             .try_send(Record::new(
                 Hash::new_unique(),
@@ -1937,8 +1937,8 @@ mod tests {
 
         let rescheduled = recv_rescheduled_transactions(&banking_stage_receiver);
         assert_eq!(rescheduled.len(), 2);
-        assert!(rescheduled.contains(&accumulated_tx));
-        assert!(rescheduled.contains(&drained_tx));
+        assert!(rescheduled.contains(&versioned_transaction_from_view(&accumulated_tx)));
+        assert!(rescheduled.contains(&versioned_transaction_from_view(&drained_tx)));
 
         drop(leader_window_info_sender);
     }

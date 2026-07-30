@@ -4,6 +4,8 @@
 //! represents an approximate amount of time since the last Entry was created.
 use {
     crate::poh::Poh,
+    agave_transaction_view::transaction_view::UnsanitizedTransactionView,
+    bytes::Bytes,
     crossbeam_channel::{Receiver, Sender},
     log::*,
     rayon::{ThreadPool, prelude::*},
@@ -16,8 +18,14 @@ use {
     solana_signature::Signature,
     solana_transaction::{Transaction, versioned::VersionedTransaction},
     solana_transaction_error::{TransactionError, TransactionResult as Result},
-    std::{iter::repeat_with, time::Instant},
-    wincode::{SchemaRead, SchemaWrite, containers::Vec as WincodeVec, len::BincodeLen},
+    std::{iter::repeat_with, mem::MaybeUninit, time::Instant},
+    wincode::{
+        ReadResult, SchemaRead, SchemaWrite, WriteResult,
+        config::Config,
+        containers::Vec as WincodeVec,
+        io::{Reader, Writer},
+        len::{BincodeLen, SeqLen},
+    },
 };
 
 pub type EntrySender = Sender<Vec<Entry>>;
@@ -26,6 +34,7 @@ pub type EntryReceiver = Receiver<Vec<Entry>>;
 pub const MAX_DATA_SHREDS_SIZE: usize =
     DEFAULT_MAX_DATA_SHREDS_PER_SLOT as usize * solana_packet::PACKET_DATA_SIZE;
 pub type MaxDataShredsLen = BincodeLen<MAX_DATA_SHREDS_SIZE>;
+pub type EntryTransaction = UnsanitizedTransactionView<Bytes>;
 
 /// Each Entry contains three pieces of data. The `num_hashes` field is the number
 /// of hashes performed since the previous entry.  The `hash` field is the result
@@ -41,7 +50,7 @@ pub type MaxDataShredsLen = BincodeLen<MAX_DATA_SHREDS_SIZE>;
 /// hash was computed by the world's fastest processor at that time. The hash chain is both
 /// a Verifiable Delay Function (VDF) and a Proof of Work (not to be confused with Proof of
 /// Work consensus!)
-#[derive(Debug, Default, PartialEq, Eq, Clone, SchemaWrite, SchemaRead)]
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub struct Entry {
     /// The number of hashes since the previous Entry ID.
     pub num_hashes: u64,
@@ -52,8 +61,71 @@ pub struct Entry {
     /// An ordered list of transactions that were observed before the Entry ID was
     /// generated. They may have been observed before a previous Entry ID but were
     /// pushed back into this list to ensure deterministic interpretation of the ledger.
-    #[wincode(with = "WincodeVec<VersionedTransaction, MaxDataShredsLen>")]
-    pub transactions: Vec<VersionedTransaction>,
+    pub transactions: Vec<EntryTransaction>,
+}
+
+// Keep the historical `Entry` wire format exactly:
+// `u64 num_hashes`, `Hash`, `u64 transaction_count`, then each serialized
+// `VersionedTransaction`. `EntryTransaction::SchemaWrite` writes its original
+// transaction bytes verbatim.
+unsafe impl<C: Config> SchemaWrite<C> for Entry {
+    type Src = Self;
+
+    fn size_of(src: &Self) -> WriteResult<usize> {
+        <MaxDataShredsLen as SeqLen<C>>::prealloc_check::<VersionedTransaction>(
+            src.transactions.len(),
+        )?;
+        let mut size = <u64 as SchemaWrite<C>>::size_of(&src.num_hashes)?
+            + <Hash as SchemaWrite<C>>::size_of(&src.hash)?
+            + <MaxDataShredsLen as SeqLen<C>>::write_bytes_needed(src.transactions.len())?;
+        for transaction in &src.transactions {
+            size += <EntryTransaction as SchemaWrite<C>>::size_of(transaction)?;
+        }
+        Ok(size)
+    }
+
+    fn write(mut writer: impl Writer, src: &Self) -> WriteResult<()> {
+        <MaxDataShredsLen as SeqLen<C>>::prealloc_check::<VersionedTransaction>(
+            src.transactions.len(),
+        )?;
+        <u64 as SchemaWrite<C>>::write(writer.by_ref(), &src.num_hashes)?;
+        <Hash as SchemaWrite<C>>::write(writer.by_ref(), &src.hash)?;
+        <MaxDataShredsLen as SeqLen<C>>::write(writer.by_ref(), src.transactions.len())?;
+        for transaction in &src.transactions {
+            <EntryTransaction as SchemaWrite<C>>::write(writer.by_ref(), transaction)?;
+        }
+        Ok(())
+    }
+}
+
+// Retain the legacy Wincode read API for transport and tooling consumers.
+// Replay deliberately does not use this implementation: converting the owned
+// transactions into views requires serializing each transaction again.
+unsafe impl<'de, C: Config> SchemaRead<'de, C> for Entry {
+    type Dst = Self;
+
+    fn read(mut reader: impl Reader<'de>, dst: &mut MaybeUninit<Self>) -> ReadResult<()> {
+        let num_hashes = <u64 as SchemaRead<'de, C>>::get(reader.by_ref())?;
+        let hash = <Hash as SchemaRead<'de, C>>::get(reader.by_ref())?;
+        let transactions = <WincodeVec<VersionedTransaction, MaxDataShredsLen> as SchemaRead<
+            'de,
+            C,
+        >>::get(reader)?
+        .iter()
+        .map(|transaction| {
+            let bytes = wincode::serialize(transaction)
+                .map_err(|_| wincode::ReadError::Custom("failed to serialize transaction"))?;
+            EntryTransaction::try_new_unsanitized(Bytes::from(bytes))
+                .map_err(|_| wincode::ReadError::Custom("invalid transaction"))
+        })
+        .collect::<ReadResult<Vec<_>>>()?;
+        dst.write(Self {
+            num_hashes,
+            hash,
+            transactions,
+        });
+        Ok(())
+    }
 }
 
 // The data needed to verify an Entry.
@@ -74,7 +146,7 @@ impl From<&Entry> for EntryVerificationData {
             signatures: entry
                 .transactions
                 .iter()
-                .flat_map(|tx| tx.signatures.iter().copied())
+                .flat_map(|tx| tx.signatures().iter().copied())
                 .collect(),
         }
     }
@@ -131,7 +203,7 @@ struct TxVerificationData {
     signatures: SmallVec<[Signature; 2]>,
     signer_pubkeys: SmallVec<[Address; 2]>,
     message_hash: Hash,
-    serialized_message: Vec<u8>,
+    serialized_message: Bytes,
 }
 
 /// TODO: we will move this API into solana-sdk.
@@ -158,7 +230,7 @@ impl UnverifiedSignatures {
 
     pub fn verify(&self) -> Result<()> {
         let verification_items = self.signatures.par_iter().flat_map_iter(|tx| {
-            let message = tx.serialized_message.as_slice();
+            let message = tx.serialized_message.as_ref();
             let len = tx.signatures.len();
 
             (0..len).map(move |i| (&tx.signatures[i], &tx.signer_pubkeys[i], message))
@@ -209,6 +281,28 @@ pub struct ValidatedHashedTransactions<Tx: TransactionWithMeta> {
     pub unverified_signatures: UnverifiedSignatures,
 }
 
+/// Converts an owned transaction into the byte-backed representation stored in
+/// an [`Entry`].
+///
+/// Block production and replay should already have serialized bytes and must
+/// not use this bridge. It remains for transaction construction, tests, and
+/// legacy interfaces that originate owned transactions.
+pub fn transaction_view_from_versioned_transaction(
+    transaction: &VersionedTransaction,
+) -> EntryTransaction {
+    let bytes = Bytes::from(
+        wincode::serialize(transaction).expect("VersionedTransaction must be serializable"),
+    );
+    EntryTransaction::try_new_unsanitized(bytes)
+        .expect("serialized VersionedTransaction must be a valid transaction view")
+}
+
+/// Converts an entry transaction to the owned form required by legacy APIs.
+pub fn versioned_transaction_from_view(transaction: &EntryTransaction) -> VersionedTransaction {
+    wincode::deserialize(transaction.data())
+        .expect("transaction view bytes must deserialize as VersionedTransaction")
+}
+
 impl Entry {
     /// Creates the next Entry `num_hashes` after `start_hash`.
     pub fn new(prev_hash: &Hash, mut num_hashes: u64, transactions: Vec<Transaction>) -> Self {
@@ -218,7 +312,11 @@ impl Entry {
             num_hashes = 1;
         }
 
-        let transactions = transactions.into_iter().map(Into::into).collect::<Vec<_>>();
+        let transactions = transactions
+            .into_iter()
+            .map(VersionedTransaction::from)
+            .map(|transaction| transaction_view_from_versioned_transaction(&transaction))
+            .collect::<Vec<_>>();
         let hash = next_hash(prev_hash, num_hashes, &transactions);
         Entry {
             num_hashes,
@@ -268,11 +366,11 @@ pub fn hash_signatures(signatures: &[impl AsRef<[u8]>]) -> Hash {
     }
 }
 
-pub fn hash_transactions(transactions: &[VersionedTransaction]) -> Hash {
+pub fn hash_transactions(transactions: &[EntryTransaction]) -> Hash {
     // a hash of a slice of transactions only needs to hash the signatures
     let signatures: Vec<_> = transactions
         .iter()
-        .flat_map(|tx| tx.signatures.iter())
+        .flat_map(|tx| tx.signatures().iter())
         .collect();
     hash_signatures(&signatures)
 }
@@ -299,14 +397,10 @@ fn next_hash_with_signatures(
 /// Creates the hash `num_hashes` after `start_hash`. If the transaction contains a signature, the
 /// final hash will be a hash of both the previous ID and the signature.  If num_hashes is zero and
 /// there's no transaction data, start_hash is returned.
-pub fn next_hash(
-    start_hash: &Hash,
-    num_hashes: u64,
-    transactions: &[VersionedTransaction],
-) -> Hash {
+pub fn next_hash(start_hash: &Hash, num_hashes: u64, transactions: &[EntryTransaction]) -> Hash {
     let signatures: Vec<_> = transactions
         .iter()
-        .flat_map(|tx| tx.signatures.iter().copied())
+        .flat_map(|tx| tx.signatures().iter().copied())
         .collect();
     next_hash_with_signatures(start_hash, num_hashes, transactions.len(), &signatures)
 }
@@ -332,7 +426,7 @@ fn validate_and_hash_entry_transactions<Tx: TransactionWithMeta, F>(
     unverified_signatures: &mut UnverifiedSignatures,
 ) -> Result<EntryType<Tx>>
 where
-    F: Fn(VersionedTransaction, &[u8]) -> Result<Tx>,
+    F: Fn(EntryTransaction) -> Result<Tx>,
 {
     if entry.transactions.is_empty() {
         return Ok(EntryType::Tick(entry.hash));
@@ -341,16 +435,18 @@ where
     let verified_transactions = entry
         .transactions
         .into_iter()
-        .map(|versioned_tx| {
-            let num_signers = usize::from(versioned_tx.message.header().num_required_signatures);
-            let static_account_keys = versioned_tx.message.static_account_keys();
+        .map(|transaction_view| {
+            let num_signers = usize::from(transaction_view.num_required_signatures());
+            let static_account_keys = transaction_view.static_account_keys();
             if static_account_keys.len() < num_signers {
                 return Err(TransactionError::SanitizeFailure);
             }
-            let signatures = versioned_tx.signatures.iter().copied().collect();
+            let signatures = transaction_view.signatures().iter().copied().collect();
             let signer_pubkeys = static_account_keys[..num_signers].iter().copied().collect();
-            let serialized_message = versioned_tx.message.serialize();
-            let verified_transaction = verify(versioned_tx, &serialized_message)?;
+            let serialized_message = transaction_view
+                .inner_data()
+                .slice_ref(transaction_view.message_data());
+            let verified_transaction = verify(transaction_view)?;
             let message_hash = *verified_transaction.message_hash();
             unverified_signatures.signatures.push(TxVerificationData {
                 is_simple_vote: verified_transaction.is_simple_vote_transaction(),
@@ -377,7 +473,7 @@ pub fn validate_and_hash_transactions<Tx: TransactionWithMeta + Send + Sync, F>(
     verify: F,
 ) -> Result<ValidatedHashedTransactions<Tx>>
 where
-    F: Fn(VersionedTransaction, &[u8]) -> Result<Tx> + Send + Sync,
+    F: Fn(EntryTransaction) -> Result<Tx> + Send + Sync,
 {
     const PARALLEL_VERIFY_THRESHOLD: usize = 200;
     if num_txs < PARALLEL_VERIFY_THRESHOLD {
@@ -553,6 +649,10 @@ pub fn next_versioned_entry(
     transactions: Vec<VersionedTransaction>,
 ) -> Entry {
     assert!(num_hashes > 0 || transactions.is_empty());
+    let transactions = transactions
+        .iter()
+        .map(transaction_view_from_versioned_transaction)
+        .collect::<Vec<_>>();
     Entry {
         num_hashes,
         hash: next_hash(prev_hash, num_hashes, &transactions),
@@ -653,7 +753,7 @@ mod tests {
         entries: Vec<Entry>,
         skip_verification: bool,
         thread_pool: &ThreadPool,
-        verify: impl Fn(VersionedTransaction, &[u8]) -> Result<Tx> + Send + Sync,
+        verify: impl Fn(EntryTransaction) -> Result<Tx> + Send + Sync,
     ) -> bool {
         let num_txs = entries.iter().map(|entry| entry.transactions.len()).sum();
         let txs = validate_and_hash_transactions(entries, num_txs, thread_pool, verify);
@@ -683,14 +783,17 @@ mod tests {
 
         // Next, verify entry slice
         let verify_transaction = {
-            move |versioned_tx: VersionedTransaction,
-                  message_bytes: &[u8]|
+            move |transaction_view: EntryTransaction|
                   -> Result<RuntimeTransaction<SanitizedTransaction>> {
+                let message_hash =
+                    solana_message::VersionedMessage::hash_raw_message(
+                        transaction_view.message_data(),
+                    );
+                let versioned_tx =
+                    versioned_transaction_from_view(&transaction_view);
                 RuntimeTransaction::try_create(
                     versioned_tx,
-                    MessageHash::Precomputed(solana_message::VersionedMessage::hash_raw_message(
-                        message_bytes,
-                    )),
+                    MessageHash::Precomputed(message_hash),
                     None,
                     SimpleAddressLoader::Disabled,
                     &ReservedAccountKeys::empty_key_set(),
@@ -714,20 +817,20 @@ mod tests {
         let tx = system_transaction::transfer(&keypair, &keypair.pubkey(), 1, zero);
         let entries = vec![Entry::new(&zero, 0, vec![tx])];
 
-        let validate_and_hash_transaction =
-            move |versioned_tx: VersionedTransaction,
-                  message_bytes: &[u8]|
-                  -> Result<RuntimeTransaction<SanitizedTransaction>> {
-                RuntimeTransaction::try_create(
-                    versioned_tx,
-                    MessageHash::Precomputed(solana_message::VersionedMessage::hash_raw_message(
-                        message_bytes,
-                    )),
-                    None,
-                    SimpleAddressLoader::Disabled,
-                    &ReservedAccountKeys::empty_key_set(),
-                )
-            };
+        let validate_and_hash_transaction = move |transaction_view: EntryTransaction| -> Result<
+            RuntimeTransaction<SanitizedTransaction>,
+        > {
+            let message_hash =
+                solana_message::VersionedMessage::hash_raw_message(transaction_view.message_data());
+            let versioned_tx = versioned_transaction_from_view(&transaction_view);
+            RuntimeTransaction::try_create(
+                versioned_tx,
+                MessageHash::Precomputed(message_hash),
+                None,
+                SimpleAddressLoader::Disabled,
+                &ReservedAccountKeys::empty_key_set(),
+            )
+        };
         let txs =
             validate_and_hash_transactions(entries, 1, &thread_pool, validate_and_hash_transaction)
                 .expect("transaction validation and hashing must not verify signatures");
@@ -759,8 +862,8 @@ mod tests {
         assert!(e0.verify(&zero));
 
         // Next, swap two transactions and ensure verification fails.
-        e0.transactions[0] = tx1.into(); // <-- attack
-        e0.transactions[1] = tx0.into();
+        e0.transactions[0] = transaction_view_from_versioned_transaction(&tx1.into()); // <-- attack
+        e0.transactions[1] = transaction_view_from_versioned_transaction(&tx0.into());
         assert!(!e0.verify(&zero));
     }
 
@@ -780,20 +883,23 @@ mod tests {
         assert!(e0.verify(&zero, &thread_pool).status());
 
         // Clear signature of the first transaction, see that it does not verify
-        let orig_sig = e0[0].transactions[0].signatures[0];
-        e0[0].transactions[0].signatures[0] = Signature::default();
+        let mut transaction = versioned_transaction_from_view(&e0[0].transactions[0]);
+        let orig_sig = transaction.signatures[0];
+        transaction.signatures[0] = Signature::default();
+        e0[0].transactions[0] = transaction_view_from_versioned_transaction(&transaction);
         assert!(!e0.verify(&zero, &thread_pool).status());
 
         // restore original signature
-        e0[0].transactions[0].signatures[0] = orig_sig;
+        transaction.signatures[0] = orig_sig;
+        e0[0].transactions[0] = transaction_view_from_versioned_transaction(&transaction);
         assert!(e0.verify(&zero, &thread_pool).status());
 
-        // Resize signatures and see verification fails.
-        let len = e0[0].transactions[0].signatures.len();
-        e0[0].transactions[0]
-            .signatures
-            .resize(len - 1, Signature::default());
-        assert!(!e0.verify(&zero, &thread_pool).status());
+        // Structurally invalid signature vectors are rejected while constructing
+        // the view, before PoH/signature verification.
+        let len = transaction.signatures.len();
+        transaction.signatures.resize(len - 1, Signature::default());
+        let serialized = Bytes::from(wincode::serialize(&transaction).unwrap());
+        assert!(UnsanitizedTransactionView::try_new_unsanitized(serialized).is_err());
 
         // Pass an entry with no transactions
         let e0 = [Entry::new(&zero, 0, vec![])];
@@ -815,7 +921,14 @@ mod tests {
         let tx0 = system_transaction::transfer(&keypair, &Pubkey::new_unique(), 42, zero);
         let entry0 = next_entry(&zero, 1, vec![tx0.clone()]);
         assert_eq!(entry0.num_hashes, 1);
-        assert_eq!(entry0.hash, next_hash(&zero, 1, &[tx0.into()]));
+        assert_eq!(
+            entry0.hash,
+            next_hash(
+                &zero,
+                1,
+                &[transaction_view_from_versioned_transaction(&tx0.into())]
+            )
+        );
     }
 
     #[test]
@@ -943,7 +1056,11 @@ mod tests {
     #[test]
     fn test_verify_tick_hash_count() {
         let hashes_per_tick = 10;
-        let tx = VersionedTransaction::default();
+        let keypair = Keypair::new();
+        let tx = transaction_view_from_versioned_transaction(
+            &system_transaction::transfer(&keypair, &Pubkey::new_unique(), 1, Hash::new_unique())
+                .into(),
+        );
 
         let no_hash_tx_entry = Entry {
             transactions: vec![tx.clone()],
@@ -1096,6 +1213,7 @@ mod tests {
         let mut transactions: Vec<_> = [test_tx(), test_tx(), test_tx()]
             .into_iter()
             .map(VersionedTransaction::from)
+            .map(|transaction| transaction_view_from_versioned_transaction(&transaction))
             .collect();
 
         // Test different permutations of the transactions have different final hashes.
@@ -1112,7 +1230,9 @@ mod tests {
         let entries = vec![next_versioned_entry(&Hash::default(), 1, vec![tx.clone()])];
         let mut serialized_entries = wincode::serialize(&entries).unwrap();
 
-        assert!(wincode::deserialize::<Vec<Entry>>(&serialized_entries).is_ok());
+        assert!(
+            crate::parse::entries_from_bytes(&Bytes::copy_from_slice(&serialized_entries)).is_ok()
+        );
 
         let serialized_tx = wincode::serialize(&tx).unwrap();
         let tx_offset = serialized_entries
@@ -1143,5 +1263,6 @@ mod tests {
                 "invalid transaction config mask"
             ))
         ));
+        assert!(crate::parse::entries_from_bytes(&Bytes::from(serialized_entries)).is_err());
     }
 }

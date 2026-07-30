@@ -4,10 +4,13 @@ use {
         leader_slot_timing_metrics::LeaderExecuteAndCommitTimings,
         scheduler_messages::MaxAge,
     },
+    agave_scheduling_utils::transaction_ptr::TransactionPtr,
     smallvec::SmallVec,
     solana_cost_model::{cost_model::CostModel, transaction_cost::TransactionCost},
+    solana_entry::entry::{EntryTransaction, transaction_view_from_versioned_transaction},
     solana_hash::Hash,
     solana_measure::measure_us,
+    solana_perf::packet::bytes::Bytes,
     solana_poh::{
         poh_recorder::PohRecorderError,
         transaction_recorder::{RecordTransactionsTimings, TransactionRecorder},
@@ -19,7 +22,10 @@ use {
         },
         transaction_batch::TransactionBatch,
     },
-    solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
+    solana_runtime_transaction::{
+        runtime_transaction::{RuntimeTransaction, RuntimeTransactionView},
+        transaction_with_meta::TransactionWithMeta,
+    },
     solana_svm::{
         account_loader::validate_fee_payer,
         transaction_error_metrics::TransactionErrorMetrics,
@@ -28,10 +34,35 @@ use {
         },
         transaction_processor::{ExecutionRecordingConfig, TransactionProcessingConfig},
     },
+    solana_transaction::{sanitized::SanitizedTransaction, versioned::VersionedTransaction},
     solana_transaction_error::TransactionError,
     solana_vote::vote_parser,
     std::num::Saturating,
 };
+
+pub trait EntryTransactionProvider {
+    fn to_entry_transaction(&self) -> EntryTransaction;
+}
+
+impl EntryTransactionProvider for RuntimeTransactionView {
+    fn to_entry_transaction(&self) -> EntryTransaction {
+        self.clone_as_unsanitized()
+    }
+}
+
+impl EntryTransactionProvider for RuntimeTransactionView<TransactionPtr> {
+    fn to_entry_transaction(&self) -> EntryTransaction {
+        EntryTransaction::try_new_unsanitized(Bytes::copy_from_slice(self.data()))
+            .expect("resolved transaction view must remain parseable")
+    }
+}
+
+impl EntryTransactionProvider for RuntimeTransaction<SanitizedTransaction> {
+    fn to_entry_transaction(&self) -> EntryTransaction {
+        let transaction: VersionedTransaction = self.to_versioned_transaction();
+        transaction_view_from_versioned_transaction(&transaction)
+    }
+}
 
 /// Consumer will create chunks of transactions from buffer with up to this size.
 pub const TARGET_NUM_TRANSACTIONS_PER_BATCH: usize = 64;
@@ -132,7 +163,7 @@ impl Consumer {
     pub fn process_and_record_transactions(
         &self,
         bank: &Bank,
-        txs: &[impl TransactionWithMeta],
+        txs: &[impl TransactionWithMeta + EntryTransactionProvider],
     ) -> ProcessTransactionBatchOutput {
         let mut error_counters = TransactionErrorMetrics::default();
         let pre_results =
@@ -179,7 +210,7 @@ impl Consumer {
     pub fn process_and_record_aged_transactions(
         &self,
         bank: &Bank,
-        txs: &[impl TransactionWithMeta],
+        txs: &[impl TransactionWithMeta + EntryTransactionProvider],
         max_ages: &[MaxAge],
         flags: &ExecutionFlags,
     ) -> ProcessTransactionBatchOutput {
@@ -199,7 +230,7 @@ impl Consumer {
     fn process_and_record_transactions_with_pre_results(
         &self,
         bank: &Bank,
-        txs: &[impl TransactionWithMeta],
+        txs: &[impl TransactionWithMeta + EntryTransactionProvider],
         pre_results: impl Iterator<Item = Result<(), TransactionError>>,
         flags: &ExecutionFlags,
     ) -> ProcessTransactionBatchOutput {
@@ -234,7 +265,7 @@ impl Consumer {
     fn execute_and_commit_transactions_locked(
         &self,
         bank: &Bank,
-        batch: &TransactionBatch<impl TransactionWithMeta>,
+        batch: &TransactionBatch<impl TransactionWithMeta + EntryTransactionProvider>,
         flags: &ExecutionFlags,
     ) -> ExecuteAndCommitTransactionsOutput {
         let transaction_status_sender_enabled = self.committer.transaction_status_sender_enabled();
@@ -362,7 +393,7 @@ impl Consumer {
             {
                 if processing_result.was_processed() {
                     entry_bytes += tx.serialized_size() as u64;
-                    processed_transactions.push(tx.to_versioned_transaction());
+                    processed_transactions.push(tx.to_entry_transaction());
                 }
             }
             processed_transactions
@@ -905,12 +936,15 @@ mod tests {
         } = setup_test(None);
 
         let pubkey = solana_pubkey::new_rand();
-        let transactions = sanitize_transactions(vec![system_transaction::transfer(
-            &mint_keypair,
-            &pubkey,
-            1,
-            bank.confirmed_last_blockhash(),
-        )]);
+        let transactions = vec![RuntimeTransactionView::from_transaction_for_view_tests(
+            system_transaction::transfer(
+                &mint_keypair,
+                &pubkey,
+                1,
+                bank.confirmed_last_blockhash(),
+            ),
+        )];
+        let transaction_data_ptr = transactions[0].data().as_ptr();
 
         let process_transactions_batch_output =
             consumer.process_and_record_transactions(&bank, &transactions);
@@ -937,6 +971,11 @@ mod tests {
         let record = record_receiver.drain().next().unwrap();
         assert_eq!(record.bank_id, bank.bank_id());
         assert_eq!(record.transactions.len(), 1);
+        assert_eq!(
+            record.transactions[0].data().as_ptr(),
+            transaction_data_ptr,
+            "recording a Bytes-backed runtime view should share its allocation",
+        );
 
         let transactions = sanitize_transactions(vec![system_transaction::transfer(
             &mint_keypair,

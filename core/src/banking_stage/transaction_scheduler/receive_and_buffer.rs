@@ -32,8 +32,10 @@ use {
         bank_forks::{BankPair, SharableBanks},
     },
     solana_runtime_transaction::{
-        runtime_transaction::RuntimeTransaction, sanitize_config::sanitize_config,
-        transaction_meta::TransactionMeta, transaction_with_meta::TransactionWithMeta,
+        runtime_transaction::{RuntimeTransaction, RuntimeTransactionView},
+        sanitize_config::sanitize_config,
+        transaction_meta::TransactionMeta,
+        transaction_with_meta::TransactionWithMeta,
     },
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     solana_svm_transaction::svm_message::SVMMessage,
@@ -142,7 +144,7 @@ pub(crate) struct TransactionViewReceiveAndBuffer {
 }
 
 impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
-    type Transaction = RuntimeTransaction<ResolvedTransactionView<Bytes>>;
+    type Transaction = RuntimeTransactionView;
     type Container = TransactionViewStateContainer;
 
     fn receive_and_buffer_packets(

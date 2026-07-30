@@ -843,7 +843,10 @@ mod tests {
         crossbeam_channel::bounded,
         itertools::Itertools,
         solana_entry::{
-            entry::{self, EntrySlice},
+            entry::{
+                self, EntrySlice, transaction_view_from_versioned_transaction,
+                versioned_transaction_from_view,
+            },
             entry_or_marker::EntryOrMarker,
         },
         solana_hash::Hash,
@@ -865,7 +868,9 @@ mod tests {
         solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_signer::Signer,
         solana_system_transaction as system_transaction,
-        solana_transaction::{Transaction, sanitized::SanitizedTransaction},
+        solana_transaction::{
+            Transaction, sanitized::SanitizedTransaction, versioned::VersionedTransaction,
+        },
         solana_vote::vote_transaction::new_tower_sync_transaction,
         solana_vote_program::vote_state::TowerSync,
         std::{sync::atomic::Ordering, thread::sleep, time::Instant},
@@ -1057,7 +1062,12 @@ mod tests {
                 .status()
         );
         for entry in entries {
-            bank.process_entry_transactions(entry.transactions)
+            let transactions = entry
+                .transactions
+                .iter()
+                .map(versioned_transaction_from_view)
+                .collect();
+            bank.process_entry_transactions(transactions)
                 .iter()
                 .for_each(|x| assert_eq!(*x, Ok(())));
         }
@@ -1169,8 +1179,13 @@ mod tests {
 
         let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
         for entry in entries {
+            let transactions = entry
+                .transactions
+                .iter()
+                .map(versioned_transaction_from_view)
+                .collect();
             let _ = bank
-                .try_process_entry_transactions(entry.transactions)
+                .try_process_entry_transactions(transactions)
                 .expect("All transactions should be processed");
         }
 
@@ -1199,10 +1214,14 @@ mod tests {
         let keypair2 = Keypair::new();
         let pubkey2 = solana_pubkey::new_rand();
 
-        let txs = vec![
-            system_transaction::transfer(&mint_keypair, &pubkey, 1, genesis_config.hash()).into(),
-            system_transaction::transfer(&keypair2, &pubkey2, 1, genesis_config.hash()).into(),
-        ];
+        let txs: Vec<_> = [
+            system_transaction::transfer(&mint_keypair, &pubkey, 1, genesis_config.hash()),
+            system_transaction::transfer(&keypair2, &pubkey2, 1, genesis_config.hash()),
+        ]
+        .into_iter()
+        .map(VersionedTransaction::from)
+        .map(|transaction| transaction_view_from_versioned_transaction(&transaction))
+        .collect();
 
         let summary = recorder.record_transactions(bank.bank_id(), txs.clone());
         assert!(summary.result.is_ok());

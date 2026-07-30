@@ -9,7 +9,7 @@
 
 use {
     crossbeam_channel::{Receiver, RecvTimeoutError, Sender},
-    solana_entry::entry::Entry,
+    solana_entry::entry::{Entry, versioned_transaction_from_view},
     solana_ledger::{
         blockstore::{Blockstore, CompletedDataSetInfo},
         deshred_transaction_notifier_interface::{
@@ -234,16 +234,17 @@ impl CompletedDataSetsService {
 
         for entry in entries {
             for tx in &entry.transactions {
+                let tx = versioned_transaction_from_view(tx);
                 let Some(signature) = tx.signatures.first() else {
                     continue;
                 };
 
                 stats.total_transactions += 1;
-                let is_vote = is_simple_vote_transaction(tx);
+                let is_vote = is_simple_vote_transaction(&tx);
 
                 let mut lut_measure = Measure::start("load_lut");
                 let lut_result = root_bank
-                    .map(|bank| load_transaction_addresses(tx, bank))
+                    .map(|bank| load_transaction_addresses(&tx, bank))
                     .unwrap_or(LutLoadResult::NoLookups);
                 lut_measure.stop();
 
@@ -268,7 +269,7 @@ impl CompletedDataSetsService {
                     completed_data_set_ending_shred_index_exclusive,
                     signature,
                     is_vote,
-                    tx,
+                    &tx,
                     loaded_addresses.as_ref(),
                 );
                 notify_measure.stop();
@@ -283,7 +284,7 @@ impl CompletedDataSetsService {
             .flat_map(|e| {
                 e.transactions
                     .into_iter()
-                    .filter_map(|mut t| t.signatures.drain(..).next())
+                    .filter_map(|transaction| transaction.signatures().first().copied())
             })
             .collect::<Vec<Signature>>()
     }

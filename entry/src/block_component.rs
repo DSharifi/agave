@@ -137,6 +137,7 @@ use {
         reward_certificate::{NotarRewardCertificate, SkipRewardCertificate},
         unverified_vote_message::UnverifiedCertificate,
     },
+    bytes::Bytes,
     solana_bls_signatures::{
         BlsError, Signature as BLSSignature, SignatureCompressed as BLSSignatureCompressed,
         signature::AsSignatureAffine,
@@ -574,6 +575,8 @@ unsafe impl<C: Config> SchemaWrite<C> for BlockComponent {
     }
 }
 
+// Preserve the generic Wincode read API for callers outside replay. The
+// zero-copy blockstore path uses `BlockComponent::from_bytes` instead.
 unsafe impl<'de, C: Config> SchemaRead<'de, C> for BlockComponent {
     type Dst = Self;
 
@@ -595,6 +598,36 @@ unsafe impl<'de, C: Config> SchemaRead<'de, C> for BlockComponent {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum BlockComponentParseError {
+    #[error("failed to parse entry batch: {0}")]
+    EntryBatch(#[from] crate::parse::EntryParseError),
+    #[error("failed to parse block marker: {0}")]
+    BlockMarker(#[from] wincode::ReadError),
+    #[error("too many entries: {count} >= {max}")]
+    TooManyEntries { count: usize, max: usize },
+}
+
+impl BlockComponent {
+    /// Parse a block component while retaining transaction bytes in zero-copy
+    /// views. This is the read-side counterpart to `SchemaWrite`.
+    pub fn from_bytes(payload: &Bytes) -> Result<Self, BlockComponentParseError> {
+        let (entries, consumed_len) = crate::parse::entries_from_bytes_prefix(payload)?;
+        if entries.is_empty() {
+            Ok(Self::BlockMarker(wincode::deserialize(
+                &payload[consumed_len..],
+            )?))
+        } else if entries.len() >= Self::MAX_ENTRIES {
+            Err(BlockComponentParseError::TooManyEntries {
+                count: entries.len(),
+                max: Self::MAX_ENTRIES,
+            })
+        } else {
+            Ok(Self::EntryBatch(entries))
+        }
+    }
+}
+
 /// Try to parse a Genesis certificate from a data shred payload
 pub fn genesis_certificate_from_shred(
     payload: &[u8],
@@ -603,11 +636,11 @@ pub fn genesis_certificate_from_shred(
     if !BlockComponent::infer_is_block_marker(payload).unwrap_or(false) {
         return None;
     }
-    let BlockComponent::BlockMarker(VersionedBlockMarker::V1(marker)) =
-        wincode::config::deserialize_exact(payload, packet_config()).ok()?
-    else {
-        return None;
-    };
+    let VersionedBlockMarker::V1(marker) = wincode::config::deserialize_exact(
+        payload.get(BlockComponent::ENTRY_COUNT_SIZE..)?,
+        packet_config(),
+    )
+    .ok()?;
     let BlockMarkerV1::GenesisCertificate(marker) = marker else {
         return None;
     };
@@ -851,12 +884,16 @@ mod tests {
 
         let comp = BlockComponent::new_entry_batch(mock_entries(5)).unwrap();
         let bytes = wincode::serialize(&comp).unwrap();
-        let deser: BlockComponent = wincode::deserialize(&bytes).unwrap();
+        let deser = BlockComponent::from_bytes(&Bytes::copy_from_slice(&bytes)).unwrap();
         assert_eq!(comp, deser);
+        assert_eq!(
+            comp,
+            wincode::deserialize::<BlockComponent>(&bytes).unwrap()
+        );
 
         let comp = BlockComponent::new_block_marker(marker);
         let bytes = wincode::serialize(&comp).unwrap();
-        let deser: BlockComponent = wincode::deserialize(&bytes).unwrap();
+        let deser = BlockComponent::from_bytes(&Bytes::from(bytes)).unwrap();
         assert_eq!(comp, deser);
     }
 
@@ -909,7 +946,7 @@ mod tests {
 
         let comp = BlockComponent::new_entry_batch(mock_entries(num_entries)).unwrap();
         let bytes = wincode::serialize(&comp).unwrap();
-        let deser: BlockComponent = wincode::deserialize(&bytes).unwrap();
+        let deser = BlockComponent::from_bytes(&Bytes::from(bytes)).unwrap();
         assert_eq!(comp, deser);
     }
 }

@@ -4,10 +4,9 @@ use {
         record_channels::{RecordSender, RecordSenderError},
     },
     solana_clock::BankId,
-    solana_entry::entry::hash_transactions,
+    solana_entry::entry::{EntryTransaction, hash_transactions},
     solana_hash::Hash,
     solana_measure::measure_us,
-    solana_transaction::versioned::VersionedTransaction,
     std::num::Saturating,
 };
 
@@ -52,7 +51,7 @@ impl TransactionRecorder {
     pub fn record_transactions(
         &self,
         bank_id: BankId,
-        transactions: Vec<VersionedTransaction>,
+        transactions: Vec<EntryTransaction>,
     ) -> RecordTransactionsSummary {
         let mut record_transactions_timings = RecordTransactionsTimings::default();
         let mut starting_transaction_index = None;
@@ -104,7 +103,7 @@ impl TransactionRecorder {
         &self,
         bank_id: BankId,
         mixin: Hash,
-        transactions: Vec<VersionedTransaction>,
+        transactions: Vec<EntryTransaction>,
     ) -> Result<Option<usize>, RecordSenderError> {
         self.record_sender
             .try_send(Record::new(mixin, transactions, bank_id))

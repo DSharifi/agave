@@ -469,7 +469,7 @@ impl Blockstore {
                 .into_iter()
                 .flat_map(|entry| entry.transactions);
             for (i, transaction) in transactions.enumerate() {
-                if let Some(&signature) = transaction.signatures.first() {
+                if let Some(&signature) = transaction.signatures().first() {
                     self.transaction_status_cf
                         .delete_in_batch(batch, (signature, slot));
                     self.transaction_memos_cf
@@ -478,7 +478,7 @@ impl Blockstore {
                     let meta = self.read_transaction_status((signature, slot))?;
                     let loaded_addresses = meta.map(|meta| meta.loaded_addresses);
                     let account_keys = AccountKeys::new(
-                        transaction.message.static_account_keys(),
+                        transaction.static_account_keys(),
                         loaded_addresses.as_ref(),
                     );
 
@@ -903,7 +903,7 @@ pub mod tests {
                 .filter(|entry| !entry.is_tick())
                 .cloned()
                 .flat_map(|entry| entry.transactions)
-                .map(|transaction| transaction.signatures[0])
+                .map(|transaction| transaction.signatures()[0])
                 .collect::<Vec<Signature>>()[0];
             let random_bytes: Vec<u8> = (0..64).map(|_| rand::random::<u8>()).collect();
             blockstore
@@ -944,13 +944,12 @@ pub mod tests {
             blockstore.insert_shreds(shreds, false).unwrap();
 
             for transaction in entries.into_iter().flat_map(|entry| entry.transactions) {
-                assert_eq!(transaction.signatures.len(), 1);
+                assert_eq!(transaction.signatures().len(), 1);
                 blockstore
                     .write_transaction_status(
                         slot,
-                        transaction.signatures[0],
+                        transaction.signatures()[0],
                         transaction
-                            .message
                             .static_account_keys()
                             .iter()
                             .map(|key| (key, true)),

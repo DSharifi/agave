@@ -713,6 +713,7 @@ mod tests {
         crate::{poh_controller::PohController, record_channels::record_channels},
         crossbeam_channel::bounded,
         solana_clock::{DEFAULT_HASHES_PER_TICK, DEFAULT_TICKS_PER_SLOT},
+        solana_entry::entry::transaction_view_from_versioned_transaction,
         solana_hash::Hash,
         solana_ledger::{
             blockstore::Blockstore,
@@ -722,7 +723,6 @@ mod tests {
         },
         solana_perf::test_tx::test_tx,
         solana_runtime::bank::Bank,
-        solana_transaction::versioned::VersionedTransaction,
         std::time::Duration,
     };
 
@@ -774,7 +774,9 @@ mod tests {
         record_sender
             .try_send(Record {
                 mixin: Hash::new_unique(),
-                transactions: vec![VersionedTransaction::from(test_tx())],
+                transactions: vec![transaction_view_from_versioned_transaction(
+                    &test_tx().into(),
+                )],
                 bank_id: bank.bank_id(),
             })
             .unwrap();

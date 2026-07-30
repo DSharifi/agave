@@ -10,9 +10,8 @@ use {
         vote_packet_receiver::VotePacketReceiver,
         vote_storage::VoteStorage,
     },
-    crate::banking_stage::{
-        consumer::{ExecuteAndCommitTransactionsOutput, ProcessTransactionBatchOutput},
-        transaction_scheduler::transaction_state_container::RuntimeTransactionView,
+    crate::banking_stage::consumer::{
+        EntryTransactionProvider, ExecuteAndCommitTransactionsOutput, ProcessTransactionBatchOutput,
     },
     agave_transaction_view::{
         transaction_version::TransactionVersion, transaction_view::SanitizedTransactionView,
@@ -25,7 +24,8 @@ use {
     solana_poh::poh_recorder::PohRecorderError,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
     solana_runtime_transaction::{
-        runtime_transaction::RuntimeTransaction, transaction_meta::TransactionMeta,
+        runtime_transaction::{RuntimeTransaction, RuntimeTransactionView},
+        transaction_meta::TransactionMeta,
         transaction_with_meta::TransactionWithMeta,
     },
     solana_svm::{
@@ -292,7 +292,7 @@ impl VoteWorker {
     fn process_packets_transactions(
         &self,
         bank: &Bank,
-        sanitized_transactions: &[impl TransactionWithMeta],
+        sanitized_transactions: &[impl TransactionWithMeta + EntryTransactionProvider],
         banking_stage_stats: &BankingStageStats,
         slot_metrics_tracker: &mut LeaderSlotMetricsTracker,
     ) -> ProcessTransactionsSummary {
@@ -348,7 +348,7 @@ impl VoteWorker {
     fn process_transactions(
         consumer: &Consumer,
         bank: &Bank,
-        transactions: &[impl TransactionWithMeta],
+        transactions: &[impl TransactionWithMeta + EntryTransactionProvider],
     ) -> ProcessTransactionsSummary {
         let process_transaction_batch_output =
             consumer.process_and_record_transactions(bank, transactions);
