@@ -278,8 +278,7 @@ dependencies = [
 [[package]]
 name = "agave-transaction-view"
 version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e64c87da66381a05df06a264b42f8df59521d26be773b3d64efc008d27e96e8c"
+source = "git+https://github.com/DSharifi/agave-sdk?rev=46130e5f4d231928b715d844ba09c6202a59e393#46130e5f4d231928b715d844ba09c6202a59e393"
 dependencies = [
  "bytes",
  "solana-hash 4.6.0",
@@ -7308,6 +7307,7 @@ dependencies = [
  "agave-feature-set",
  "agave-reserved-account-keys",
  "agave-snapshots",
+ "agave-transaction-view",
  "agave-votor-messages",
  "anyhow",
  "assert_matches",
@@ -8230,6 +8230,7 @@ dependencies = [
  "agave-precompiles",
  "agave-reserved-account-keys",
  "agave-snapshots",
+ "agave-transaction-view",
  "agave-votor-messages",
  "ahash 0.8.12",
  "arc-swap",
@@ -8239,6 +8240,7 @@ dependencies = [
  "bincode",
  "bitvec",
  "bytemuck",
+ "bytes",
  "crossbeam-channel",
  "crossbeam-queue",
  "crossbeam-utils",
@@ -10078,11 +10080,14 @@ dependencies = [
 name = "solana-unified-scheduler-logic"
 version = "4.4.0-alpha.0"
 dependencies = [
+ "agave-transaction-view",
  "assert_matches",
+ "bytes",
  "solana-clock",
  "solana-hash 4.6.0",
  "solana-pubkey 4.3.0",
  "solana-runtime-transaction",
+ "solana-svm-transaction",
  "solana-transaction",
  "static_assertions",
 ]
@@ -10092,7 +10097,9 @@ name = "solana-unified-scheduler-pool"
 version = "4.4.0-alpha.0"
 dependencies = [
  "agave-banking-stage-ingress-types",
+ "agave-transaction-view",
  "assert_matches",
+ "bytes",
  "crossbeam-channel",
  "dashmap",
  "derive-where",

@@ -18,6 +18,11 @@ use {
         ArchiveFormat, DEFAULT_ARCHIVE_COMPRESSION, SUPPORTED_ARCHIVE_COMPRESSION, SnapshotVersion,
         snapshot_archive_info::SnapshotArchiveInfoGetter as _, snapshot_config::SnapshotConfig,
     },
+    agave_transaction_view::{
+        resolved_transaction_view::ResolvedTransactionView,
+        transaction_view::{SanitizedTransactionView, UnsanitizedTransactionView},
+    },
+    bytes::Bytes,
     clap::{
         App, AppSettings, Arg, ArgMatches, SubCommand, crate_description, crate_name, value_t,
         value_t_or_exit, values_t_or_exit,
@@ -57,7 +62,6 @@ use {
         shred::{ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
     },
     solana_measure::{measure::Measure, measure_time},
-    solana_message::SimpleAddressLoader,
     solana_native_token::{LAMPORTS_PER_SOL, Sol},
     solana_pubkey::Pubkey,
     solana_rent::Rent,
@@ -74,7 +78,10 @@ use {
         stake_utils,
         transaction_execution::{TransactionStatusMessage, TransactionStatusSender},
     },
-    solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
+    solana_runtime_transaction::{
+        runtime_transaction::RuntimeTransaction, sanitize_config::sanitize_config,
+        transaction_with_meta::StaticTransactionWithMeta,
+    },
     solana_shred_version::compute_shred_version,
     solana_stake_interface::{self as stake, state::StakeStateV2},
     solana_system_interface::program as system_program,
@@ -450,7 +457,7 @@ fn compute_slot_cost(
         .map_or(0, |slot_meta| u64::from(slot_meta.replay_fec_set_index));
 
     let (entries, _num_shreds, _is_full) = blockstore
-        .get_slot_entries_with_shred_info(slot, replay_fec_set_index, allow_dead_slots)
+        .get_slot_entry_views_with_shred_info(slot, replay_fec_set_index, allow_dead_slots)
         .map_err(|err| format!("Slot: {slot}, Failed to load entries, err {err:?}"))?;
 
     let num_entries = entries.len();
@@ -468,12 +475,26 @@ fn compute_slot_cost(
         entry
             .transactions
             .into_iter()
-            .filter_map(|transaction| {
-                RuntimeTransaction::try_create(
-                    transaction,
-                    MessageHash::Compute,
+            .filter_map(|transaction: UnsanitizedTransactionView<Bytes>| {
+                let sanitized = transaction
+                    .sanitize(&sanitize_config())
+                    .map_err(|err| {
+                        warn!("Failed to compute cost of transaction: {err:?}");
+                    })
+                    .ok()?;
+                let statically_loaded =
+                    RuntimeTransaction::<SanitizedTransactionView<Bytes>>::try_new(
+                        sanitized,
+                        MessageHash::Compute,
+                        None,
+                    )
+                    .map_err(|err| {
+                        warn!("Failed to compute cost of transaction: {err:?}");
+                    })
+                    .ok()?;
+                RuntimeTransaction::<ResolvedTransactionView<Bytes>>::try_new(
+                    statically_loaded,
                     None,
-                    SimpleAddressLoader::Disabled,
                     &reserved_account_keys.active,
                 )
                 .map_err(|err| {
@@ -482,18 +503,17 @@ fn compute_slot_cost(
                 .ok()
             })
             .for_each(|transaction| {
-                num_programs += transaction.message().instructions().len();
+                num_programs += transaction.instructions_iter().count();
 
                 let tx_cost = CostModel::calculate_cost(&transaction, &feature_set);
                 let result = cost_tracker.try_add(&tx_cost);
                 if result.is_err() {
                     println!(
-                        "Slot: {slot}, CostModel rejected transaction {transaction:?}, reason \
-                         {result:?}",
+                        "Slot: {slot}, CostModel rejected transaction {:?}, reason {result:?}",
+                        transaction.to_versioned_transaction(),
                     );
                 }
-                for (program_id, _instruction) in transaction.message().program_instructions_iter()
-                {
+                for (program_id, _instruction) in transaction.program_instructions_iter() {
                     *program_ids.entry(*program_id).or_insert(0) += 1;
                 }
             });
