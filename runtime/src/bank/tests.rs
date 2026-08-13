@@ -9572,7 +9572,7 @@ fn transaction_view_from_versioned_transaction(
 ) -> agave_transaction_view::result::Result<UnsanitizedTransactionView<Bytes>> {
     let versioned_transaction = transaction.into();
     let versioned_transaction_serialized_bytes =
-        bincode::serialize(&versioned_transaction).unwrap();
+        wincode::serialize(&versioned_transaction).unwrap();
 
     UnsanitizedTransactionView::try_new_unsanitized(Bytes::from(
         versioned_transaction_serialized_bytes,
