@@ -213,7 +213,7 @@ mod tests {
     };
 
     fn tick_entries(n: usize) -> Vec<Entry> {
-        repeat_n(Entry::default(), n).collect()
+        repeat_n(Entry::new_tick(0, &Hash::default()), n).collect()
     }
 
     fn entry_with_transactions(num_hashes: u64, transactions: Vec<VersionedTransaction>) -> Entry {
@@ -475,7 +475,8 @@ mod tests {
         // A real single-entry, zero-transaction batch, with its tx_count field (the
         // last 8 bytes, since no transactions follow it) patched to one past the
         // largest tx_count that fits the preallocation-size guard.
-        let component = BlockComponent::new_entry_batch(vec![Entry::default()]).unwrap();
+        let component =
+            BlockComponent::new_entry_batch(vec![Entry::new_tick(0, &Hash::default())]).unwrap();
         let mut bytes = wincode::serialize(&component).unwrap();
 
         let tx_count = MAX_DATA_SHREDS_SIZE / size_of::<VersionedTransaction>() + 1;
@@ -500,7 +501,8 @@ mod tests {
         // The largest tx_count that still fits the preallocation-size guard, patched
         // into a real zero-transaction entry. No transaction data follows it, so both
         // decoders still error out - just not because of this guard.
-        let component = BlockComponent::new_entry_batch(vec![Entry::default()]).unwrap();
+        let component =
+            BlockComponent::new_entry_batch(vec![Entry::new_tick(0, &Hash::default())]).unwrap();
         let mut bytes = wincode::serialize(&component).unwrap();
 
         let tx_count = MAX_DATA_SHREDS_SIZE / size_of::<VersionedTransaction>();

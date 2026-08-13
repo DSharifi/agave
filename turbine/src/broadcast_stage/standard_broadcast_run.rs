@@ -685,7 +685,7 @@ mod test {
         super::*,
         assert_matches::assert_matches,
         rand::Rng,
-        solana_entry::entry::create_ticks,
+        solana_entry::entry::{Entry, create_ticks},
         solana_genesis_config::GenesisConfig,
         solana_gossip::{cluster_info::ClusterInfo, node::Node},
         solana_hash::Hash,
@@ -708,6 +708,13 @@ mod test {
         std::{ops::Deref, sync::Arc, time::Duration},
         test_case::test_case,
     };
+
+    fn entries_eq(a: &[Entry], b: &[Entry]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| {
+                x.num_hashes == y.num_hashes && x.hash == y.hash && x.transactions == y.transactions
+            })
+    }
 
     #[allow(clippy::type_complexity)]
     fn setup(
@@ -942,15 +949,15 @@ mod test {
         // When headers are enabled, header shreds occupy the first num_shreds_per_slot indices,
         // so entry data starts at that offset.
         let header_shred_offset = (shred_multiplier - 1) * num_shreds_per_slot;
-        assert_eq!(
-            blockstore.get_slot_entries(1, header_shred_offset).unwrap(),
-            ticks0
-        );
-        assert_eq!(
+        assert!(entries_eq(
+            &blockstore.get_slot_entries(1, header_shred_offset).unwrap(),
+            &ticks0
+        ));
+        assert!(
             blockstore
                 .get_slot_entries(1, shred_multiplier * num_shreds_per_slot)
-                .unwrap(),
-            vec![],
+                .unwrap()
+                .is_empty()
         );
 
         // Step 2: Make a transmission for another bank that interrupts the transmission for

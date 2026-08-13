@@ -408,7 +408,10 @@ mod tests {
             Shredder::deshred(shreds).unwrap()
         };
         let deshred_entries: Vec<Entry> = wincode::deserialize(&deshred_payload).unwrap();
-        assert_eq!(entries, deshred_entries);
+        assert_eq!(
+            wincode::serialize(&entries).unwrap(),
+            wincode::serialize(&deshred_entries).unwrap()
+        );
     }
 
     #[test_matrix([true, false])]

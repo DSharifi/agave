@@ -44,7 +44,7 @@ pub type MaxDataShredsLen = BincodeLen<MAX_DATA_SHREDS_SIZE>;
 /// hash was computed by the world's fastest processor at that time. The hash chain is both
 /// a Verifiable Delay Function (VDF) and a Proof of Work (not to be confused with Proof of
 /// Work consensus!)
-#[derive(Debug, Default, PartialEq, Eq, Clone, SchemaWrite, SchemaRead)]
+#[derive(Debug, Clone, SchemaWrite, SchemaRead)]
 pub struct Entry {
     /// The number of hashes since the previous Entry ID.
     pub num_hashes: u64,
@@ -1093,28 +1093,29 @@ mod tests {
         let tx = VersionedTransaction::default();
 
         let no_hash_tx_entry = Entry {
+            num_hashes: 0,
+            hash: Hash::default(),
             transactions: vec![tx.clone()],
-            ..Entry::default()
         };
         let single_hash_tx_entry = Entry {
-            transactions: vec![tx.clone()],
             num_hashes: 1,
-            ..Entry::default()
+            hash: Hash::default(),
+            transactions: vec![tx.clone()],
         };
         let partial_tx_entry = Entry {
             num_hashes: hashes_per_tick - 1,
+            hash: Hash::default(),
             transactions: vec![tx.clone()],
-            ..Entry::default()
         };
         let full_tx_entry = Entry {
             num_hashes: hashes_per_tick,
+            hash: Hash::default(),
             transactions: vec![tx.clone()],
-            ..Entry::default()
         };
         let max_hash_tx_entry = Entry {
-            transactions: vec![tx],
             num_hashes: u64::MAX,
-            ..Entry::default()
+            hash: Hash::default(),
+            transactions: vec![tx],
         };
 
         let no_hash_tick_entry = Entry::new_tick(0, &Hash::default());

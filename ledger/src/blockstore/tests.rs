@@ -33,6 +33,14 @@ use {
 };
 
 // used for tests only
+fn entries_eq(a: &[Entry], b: &[Entry]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.num_hashes == y.num_hashes && x.hash == y.hash && x.transactions == y.transactions
+        })
+}
+
+// used for tests only
 pub(crate) fn make_slot_entries_with_transactions(num_entries: u64) -> Vec<Entry> {
     let mut entries: Vec<Entry> = Vec::new();
     for x in 0..num_entries {
@@ -200,7 +208,7 @@ fn test_create_new_ledger() {
     let ticks = create_ticks(genesis_config.ticks_per_slot, 0, genesis_config.hash());
     let entries = blockstore.get_slot_entries(0, 0).unwrap();
 
-    assert_eq!(ticks, entries);
+    assert!(entries_eq(&ticks, &entries));
     assert!(
         Path::new(ledger_path.path())
             .join(BLOCKSTORE_DIRECTORY_ROCKS_LEVEL)
@@ -299,10 +307,10 @@ fn test_write_entries() {
             assert_eq!(meta.parent_slot, Some(i - 1));
         }
 
-        assert_eq!(
+        assert!(entries_eq(
             &ticks[(i * ticks_per_slot) as usize..((i + 1) * ticks_per_slot) as usize],
-            &blockstore.get_slot_entries(i, 0).unwrap()[..]
-        );
+            &blockstore.get_slot_entries(i, 0).unwrap()
+        ));
     }
 }
 
@@ -494,7 +502,7 @@ fn test_insert_data_shreds_basic() {
     blockstore.insert_shreds(shreds, false).unwrap();
     let result = blockstore.get_slot_entries(0, 0).unwrap();
 
-    assert_eq!(result, entries);
+    assert!(entries_eq(&result, &entries));
 
     let meta = blockstore
         .meta(0)
@@ -538,7 +546,7 @@ fn test_insert_data_shreds_reverse() {
             assert!(meta.consumed == 0 && meta.received == num_shreds);
         } else {
             assert_eq!(meta.parent_slot, Some(0));
-            assert_eq!(result, entries);
+            assert!(entries_eq(&result, &entries));
             assert!(meta.consumed == num_shreds && meta.received == num_shreds);
         }
     }
@@ -560,10 +568,10 @@ fn test_get_slot_entries1() {
         .insert_shreds(shreds, false)
         .expect("Expected successful write of shreds");
 
-    assert_eq!(
-        blockstore.get_slot_entries(1, 0).unwrap()[2..4],
-        entries[2..4],
-    );
+    assert!(entries_eq(
+        &blockstore.get_slot_entries(1, 0).unwrap()[2..4],
+        &entries[2..4],
+    ));
 }
 
 #[test]
@@ -586,7 +594,7 @@ fn test_get_slot_entries3() {
         blockstore
             .insert_shreds(shreds, false)
             .expect("Expected successful write of shreds");
-        assert_eq!(blockstore.get_slot_entries(slot, 0).unwrap(), entries);
+        assert!(entries_eq(&blockstore.get_slot_entries(slot, 0).unwrap(), &entries));
     }
 }
 
@@ -618,7 +626,7 @@ fn test_insert_data_shreds_consecutive() {
 
         blockstore.insert_shreds(odd_shreds, false).unwrap();
 
-        assert_eq!(blockstore.get_slot_entries(slot, 0).unwrap(), vec![]);
+        assert!(blockstore.get_slot_entries(slot, 0).unwrap().is_empty());
 
         let meta = blockstore.meta(slot).unwrap().unwrap();
         if num_shreds.is_multiple_of(2) {
@@ -636,10 +644,10 @@ fn test_insert_data_shreds_consecutive() {
 
         blockstore.insert_shreds(even_shreds, false).unwrap();
 
-        assert_eq!(
-            blockstore.get_slot_entries(slot, 0).unwrap(),
-            original_entries,
-        );
+        assert!(entries_eq(
+            &blockstore.get_slot_entries(slot, 0).unwrap(),
+            &original_entries,
+        ));
 
         let meta = blockstore.meta(slot).unwrap().unwrap();
         assert_eq!(meta.received, num_shreds);
@@ -1431,10 +1439,10 @@ fn test_insert_data_shreds_slots(should_bulk_write: bool) {
     }
 
     for i in 0..num_slots - 1 {
-        assert_eq!(
-            blockstore.get_slot_entries(i, 0).unwrap()[0],
-            entries[i as usize]
-        );
+        assert!(entries_eq(
+            &blockstore.get_slot_entries(i, 0).unwrap()[..1],
+            &entries[i as usize..i as usize + 1]
+        ));
 
         let meta = blockstore.meta(i).unwrap().unwrap();
         assert_eq!(meta.received, DATA_SHREDS_PER_FEC_BLOCK as u64);
@@ -3043,7 +3051,7 @@ fn test_get_complete_block_with_block_markers() {
     let (slot_entries, num_shreds, is_full) = blockstore
         .get_slot_entries_with_shred_info(slot, 0, false)
         .unwrap();
-    assert_eq!(slot_entries, entries);
+    assert!(entries_eq(&slot_entries, &entries));
     assert_eq!(num_shreds, u64::from(slot_end_index));
     assert!(is_full);
 
@@ -3053,12 +3061,12 @@ fn test_get_complete_block_with_block_markers() {
             .unwrap()
             .is_empty()
     );
-    assert_eq!(
-        blockstore
+    assert!(entries_eq(
+        &blockstore
             .get_entries_in_data_block(slot, entry_start_index..entry_end_index, None)
             .unwrap(),
-        entries
-    );
+        &entries
+    ));
     assert!(
         blockstore
             .get_entries_in_data_block(slot, entry_end_index..slot_end_index, None)
@@ -5431,7 +5439,7 @@ fn test_insert_data_shreds_same_slot_last_index() {
             .unwrap();
         let meta = blockstore.meta(0).unwrap().unwrap();
         assert!(!blockstore.is_dead(0));
-        assert_eq!(blockstore.get_slot_entries(0, 0).unwrap(), vec![]);
+        assert!(blockstore.get_slot_entries(0, 0).unwrap().is_empty());
         assert_eq!(meta.consumed, 0);
         assert_eq!(meta.received, last_index + 1);
         assert_eq!(meta.parent_slot, Some(0));
@@ -5442,7 +5450,10 @@ fn test_insert_data_shreds_same_slot_last_index() {
     let num_shreds = duplicate_shreds.len() as u64;
     blockstore.insert_shreds(duplicate_shreds, false).unwrap();
 
-    assert_eq!(blockstore.get_slot_entries(0, 0).unwrap(), original_entries);
+    assert!(entries_eq(
+        &blockstore.get_slot_entries(0, 0).unwrap(),
+        &original_entries
+    ));
 
     let meta = blockstore.meta(0).unwrap().unwrap();
     assert_eq!(meta.consumed, num_shreds);

@@ -1952,7 +1952,15 @@ mod tests {
 
         let entry_component: BlockComponent =
             wincode::deserialize(&deshred_batch(batches[2])).unwrap();
-        assert_eq!(entry_component, BlockComponent::EntryBatch(vec![entry]));
+        match entry_component {
+            BlockComponent::EntryBatch(entries) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].num_hashes, entry.num_hashes);
+                assert_eq!(entries[0].hash, entry.hash);
+                assert_eq!(entries[0].transactions, entry.transactions);
+            }
+            BlockComponent::BlockMarker(_) => panic!("expected EntryBatch"),
+        }
 
         let footer_component: BlockComponent =
             wincode::deserialize(&deshred_batch(batches[3])).unwrap();

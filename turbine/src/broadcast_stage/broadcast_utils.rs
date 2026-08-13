@@ -261,6 +261,13 @@ mod tests {
         solana_transaction::Transaction,
     };
 
+    fn entries_eq(a: &[Entry], b: &[Entry]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| {
+                x.num_hashes == y.num_hashes && x.hash == y.hash && x.transactions == y.transactions
+            })
+    }
+
     fn setup_test() -> (
         GenesisConfig,
         Arc<Bank>,
@@ -335,7 +342,7 @@ mod tests {
             }
         }
         assert_eq!(last_tick_height, bank1.max_tick_height());
-        assert_eq!(res_entries, entries);
+        assert!(entries_eq(&res_entries, &entries));
     }
 
     #[test]
@@ -363,7 +370,7 @@ mod tests {
         assert_eq!(result.last_tick_height, 1);
         assert!(matches!(
             result.component,
-            BlockComponent::EntryBatch(ref batch) if batch == &entries[..1]
+            BlockComponent::EntryBatch(ref batch) if entries_eq(batch, &entries[..1])
         ));
         assert!(carryover.is_some() || !r.is_empty());
     }
@@ -426,7 +433,7 @@ mod tests {
         }
         assert_eq!(bank_slot, bank2.slot());
         assert_eq!(last_tick_height, expected_last_height);
-        assert_eq!(res_entries, vec![last_entry]);
+        assert!(entries_eq(&res_entries, &[last_entry]));
     }
 
     #[test]
@@ -500,7 +507,7 @@ mod tests {
             recv_slot_components(&r, &mut carryover, &mut ProcessShredsStats::default()).unwrap();
         assert!(matches!(result.component, BlockComponent::EntryBatch(ref e) if e.len() == 1));
         if let BlockComponent::EntryBatch(ref entries) = result.component {
-            assert_eq!(entries[0], entry1);
+            assert!(entries_eq(&entries[..1], &[entry1]));
         }
         assert_eq!(result.last_tick_height, 1);
 
@@ -515,7 +522,7 @@ mod tests {
             recv_slot_components(&r, &mut carryover, &mut ProcessShredsStats::default()).unwrap();
         assert!(matches!(result.component, BlockComponent::EntryBatch(ref e) if e.len() == 1));
         if let BlockComponent::EntryBatch(ref entries) = result.component {
-            assert_eq!(entries[0], entry2);
+            assert!(entries_eq(&entries[..1], &[entry2]));
         }
         assert_eq!(result.last_tick_height, 3);
     }

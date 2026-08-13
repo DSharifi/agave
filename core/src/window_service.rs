@@ -523,6 +523,13 @@ mod test {
         solana_time_utils::timestamp,
     };
 
+    fn entries_eq(a: &[Entry], b: &[Entry]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| {
+                x.num_hashes == y.num_hashes && x.hash == y.hash && x.transactions == y.transactions
+            })
+    }
+
     fn local_entries_to_shred(
         entries: &[Entry],
         slot: Slot,
@@ -556,7 +563,10 @@ mod test {
             .insert_shreds(shreds, false)
             .expect("Expect successful processing of shred");
 
-        assert_eq!(blockstore.get_slot_entries(0, 0).unwrap(), original_entries);
+        assert!(entries_eq(
+            &blockstore.get_slot_entries(0, 0).unwrap(),
+            &original_entries
+        ));
     }
 
     #[test]

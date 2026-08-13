@@ -482,7 +482,7 @@ impl VersionedBlockMarker {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum BlockComponent {
     EntryBatch(Vec<Entry>),
@@ -693,7 +693,7 @@ mod tests {
     };
 
     fn mock_entries(n: usize) -> Vec<Entry> {
-        repeat_n(Entry::default(), n).collect()
+        repeat_n(Entry::new_tick(0, &Hash::default()), n).collect()
     }
 
     fn sample_footer() -> BlockFooterV1 {
@@ -860,12 +860,12 @@ mod tests {
         let comp = BlockComponent::new_entry_batch(mock_entries(5)).unwrap();
         let bytes = wincode::serialize(&comp).unwrap();
         let deser: BlockComponent = wincode::deserialize(&bytes).unwrap();
-        assert_eq!(comp, deser);
+        assert_eq!(wincode::serialize(&deser).unwrap(), bytes);
 
         let comp = BlockComponent::new_block_marker(marker);
         let bytes = wincode::serialize(&comp).unwrap();
         let deser: BlockComponent = wincode::deserialize(&bytes).unwrap();
-        assert_eq!(comp, deser);
+        assert_eq!(wincode::serialize(&deser).unwrap(), bytes);
     }
 
     #[test]
@@ -918,6 +918,6 @@ mod tests {
         let comp = BlockComponent::new_entry_batch(mock_entries(num_entries)).unwrap();
         let bytes = wincode::serialize(&comp).unwrap();
         let deser: BlockComponent = wincode::deserialize(&bytes).unwrap();
-        assert_eq!(comp, deser);
+        assert_eq!(wincode::serialize(&deser).unwrap(), bytes);
     }
 }
