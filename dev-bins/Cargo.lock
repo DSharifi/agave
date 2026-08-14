@@ -238,6 +238,7 @@ dependencies = [
  "solana-svm-callback",
  "solana-svm-feature-set",
  "solana-svm-log-collector",
+ "solana-svm-transaction",
  "solana-syscalls",
  "solana-system-interface 3.3.0",
  "solana-transaction",

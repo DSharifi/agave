@@ -32,7 +32,7 @@ use {
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
     solana_signer_store::{Decoded, decode},
-    solana_transaction::versioned::VersionedTransaction,
+    solana_transaction::versioned::{VersionedTransaction, sanitized::SanitizedVersionedTransaction},
     solana_transaction_status::{
         BlockEncodingOptions, ConfirmedBlock, Encodable, EncodedConfirmedBlock,
         EncodedTransactionWithStatusMeta, EntrySummary, Rewards, TransactionDetails,
@@ -986,8 +986,12 @@ pub fn output_slot(
 
             for transaction in block_contents.transactions() {
                 num_transactions += 1;
-                for program_id in get_program_ids(transaction) {
-                    *program_ids.entry(*program_id).or_insert(0) += 1;
+                if let Ok(transaction) =
+                    SanitizedVersionedTransaction::try_new(transaction.clone())
+                {
+                    for program_id in get_program_ids(&transaction) {
+                        *program_ids.entry(*program_id).or_insert(0) += 1;
+                    }
                 }
             }
             println!(

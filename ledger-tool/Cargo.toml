@@ -83,6 +83,7 @@ solana-storage-bigtable = { workspace = true }
 solana-svm-callback = { workspace = true }
 solana-svm-feature-set = { workspace = true }
 solana-svm-log-collector = { workspace = true }
+solana-svm-transaction = { workspace = true }
 solana-syscalls = { workspace = true }
 solana-system-interface = { workspace = true }
 solana-transaction = { workspace = true }

@@ -43,7 +43,7 @@ use {
         transaction_execution::TransactionStatusSender,
     },
     solana_shred_version::compute_shred_version,
-    solana_transaction::versioned::VersionedTransaction,
+    solana_svm_transaction::svm_message::SVMStaticMessage,
     solana_unified_scheduler_pool::DefaultSchedulerPool,
     std::{
         path::{Path, PathBuf},
@@ -606,14 +606,9 @@ pub fn open_genesis_config_by(ledger_path: &Path, matches: &ArgMatches<'_>) -> G
     })
 }
 
-pub fn get_program_ids(tx: &VersionedTransaction) -> impl Iterator<Item = &Pubkey> + '_ {
-    let message = &tx.message;
-    let account_keys = message.static_account_keys();
-
-    message
-        .instructions()
-        .iter()
-        .map(|ix| ix.program_id(account_keys))
+pub fn get_program_ids<T: SVMStaticMessage>(tx: &T) -> impl Iterator<Item = &Pubkey> + '_ {
+    tx.program_instructions_iter()
+        .map(|(program_id, _ix)| program_id)
 }
 
 /// Get the AccessType required, based on `process_options`
