@@ -6,30 +6,11 @@ resolver = "2"
 [workspace.package]
 version = "4.4.0-alpha.2"
 authors = ["Anza Maintainers <maintainers@anza.xyz>"]
-description = "Blockchain, Rebuilt for Scale"
-repository = "https://github.com/anza-xyz/agave"
-homepage = "https://anza.xyz/"
-license = "Apache-2.0"
 edition = "2024"
-
-[workspace.lints.rust.unexpected_cfgs]
-level = "warn"
-check-cfg = [
-    'cfg(target_os, values("solana"))',
-    'cfg(feature, values("frozen-abi", "no-entrypoint"))',
-]
-
-# Clippy lint configuration that can not be applied in clippy.toml
-[workspace.lints.clippy]
-# Denied lints
-arithmetic_side_effects = "deny"
-default_trait_access = "deny"
-manual_let_else = "deny"
-uninlined_format_args = "deny"
-used_underscore_binding = "deny"
-
-# Allowed lints
-new_without_default = "allow"
+description = "Blockchain, Rebuilt for Scale"
+homepage = "https://anza.xyz/"
+repository = "https://github.com/anza-xyz/agave"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 agave-feature-set = { path = "../feature-set", version = "=4.4.0-alpha.2", features = ["agave-unstable-api"] }
@@ -52,9 +33,13 @@ env_logger = "0.11.11"
 futures = "0.3.34"
 histogram = "0.6.9"
 itertools = "0.15.0"
-jemallocator = { package = "tikv-jemallocator", version = "0.6.0", features = [
+jemallocator = {
+  package = "tikv-jemallocator",
+  version = "0.6.0",
+  features = [
     "unprefixed_malloc_on_supported_platforms",
-] }
+  ]
+}
 log = "0.4.28"
 num_cpus = "1.17.0"
 pretty-hex = "0.4.2"
@@ -158,6 +143,29 @@ thiserror = "2.0.17"
 tokio = "1.48.0"
 wincode = { version = "0.6.1", features = ["derive"] }
 
+# Clippy lint configuration that can not be applied in clippy.toml
+[workspace.lints.clippy]
+# Denied lints
+arithmetic_side_effects = "deny"
+default_trait_access = "deny"
+manual_let_else = "deny"
+uninlined_format_args = "deny"
+used_underscore_binding = "deny"
+
+# Allowed lints
+new_without_default = "allow"
+
+[workspace.lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = [
+  'cfg(target_os, values("solana"))',
+  'cfg(feature, values("frozen-abi", "no-entrypoint"))',
+]
+
+[patch.crates-io]
+librocksdb-sys = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }
+rocksdb = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }
+
 [profile.dev]
 debug = "line-tables-only"
 
@@ -178,6 +186,10 @@ opt-level = 3
 [profile.dev.package.solana-ed25519]
 opt-level = 3
 
+[profile.release]
+split-debuginfo = "unpacked"
+lto = "thin"
+
 [profile.full-dev]
 inherits = "dev"
 debug = "full"
@@ -185,18 +197,10 @@ debug = "full"
 [profile.release-with-debug]
 inherits = "release"
 debug = true
-strip = false
 split-debuginfo = "off"
-
-[profile.release]
-split-debuginfo = "unpacked"
-lto = "thin"
+strip = false
 
 [profile.release-with-lto]
 inherits = "release"
 lto = "fat"
 codegen-units = 1
-
-[patch.crates-io]
-librocksdb-sys = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }
-rocksdb = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }
