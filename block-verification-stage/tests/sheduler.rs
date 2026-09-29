@@ -1,14 +1,10 @@
 use {
     block_verification_stage::{
-        BlockVerificationStage, SchedulerConfig,
+        SchedulerConfig,
         messages::{BlockVerificationOutcome, BlockVerificationToReplayMessage},
         run_scheduler,
         stage::{
             Aborted, AllEntriesSubmitted, BlockVerificationSession, SchedulerShutdownError, Started,
-        },
-        verification_components::{
-            entry_hash_verification::MockVerifyEntryHash,
-            signature_verification::MockVerifySignature,
         },
     },
     crossbeam_channel::RecvTimeoutError,
@@ -27,17 +23,9 @@ const BANK_ID: BankId = 123;
 const SLOT: Slot = 120;
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn block_verification_stage() -> BlockVerificationStage {
-    run_scheduler(
-        TEST_SCHEDULER_CONFIG,
-        MockVerifySignature::default(),
-        MockVerifyEntryHash::default(),
-    )
-}
-
 #[test]
 fn block_with_no_entries_notifying_that_all_entries_are_submitted_passes_verification() {
-    let stage = block_verification_stage();
+    let stage = run_scheduler(TEST_SCHEDULER_CONFIG);
 
     let session: BlockVerificationSession<Started> =
         stage.begin_block(BANK_ID, SLOT, BOGUS_HASH).unwrap();
@@ -61,7 +49,7 @@ fn block_with_no_entries_notifying_that_all_entries_are_submitted_passes_verific
 
 #[test]
 fn aborting_block_before_all_entries_submitted_sends_aborted_and_releases_bank_id_and_slot() {
-    let stage = block_verification_stage();
+    let stage = run_scheduler(TEST_SCHEDULER_CONFIG);
 
     let session: BlockVerificationSession<Started> =
         stage.begin_block(BANK_ID, SLOT, BOGUS_HASH).unwrap();
@@ -105,7 +93,7 @@ fn aborting_block_before_all_entries_submitted_sends_aborted_and_releases_bank_i
 // outcome is sent.
 #[test]
 fn aborting_block_after_it_completed_is_ignored() {
-    let stage = block_verification_stage();
+    let stage = run_scheduler(TEST_SCHEDULER_CONFIG);
 
     let session: BlockVerificationSession<Started> =
         stage.begin_block(BANK_ID, SLOT, BOGUS_HASH).unwrap();
@@ -151,7 +139,7 @@ fn aborting_block_after_it_completed_is_ignored() {
 
 #[test]
 fn outcomes_of_concurrent_blocks_are_sent_in_completion_order() {
-    let stage = block_verification_stage();
+    let stage = run_scheduler(TEST_SCHEDULER_CONFIG);
 
     const FIRST_BANK_ID: BankId = 1;
     const FIRST_SLOT: Slot = 120;
@@ -229,7 +217,7 @@ fn reusing_bank_id_or_slot_in_progress_panics_scheduler(
     second_bank_id: BankId,
     second_slot: Slot,
 ) {
-    let stage = block_verification_stage();
+    let stage = run_scheduler(TEST_SCHEDULER_CONFIG);
 
     let _first_session: BlockVerificationSession<Started> = stage
         .begin_block(first_bank_id, first_slot, BOGUS_HASH)
@@ -258,7 +246,7 @@ fn reusing_bank_id_or_slot_in_progress_panics_scheduler(
 #[test_case(BlockVerificationOutcome::Aborted; "started")]
 #[test_case(BlockVerificationOutcome::Verified; "all_entries_submitted")]
 fn dropping_session_releases_bank_id_and_slot(expected_outcome: BlockVerificationOutcome) {
-    let stage = block_verification_stage();
+    let stage = run_scheduler(TEST_SCHEDULER_CONFIG);
 
     let session: BlockVerificationSession<Started> =
         stage.begin_block(BANK_ID, SLOT, BOGUS_HASH).unwrap();
@@ -309,7 +297,7 @@ fn dropping_session_releases_bank_id_and_slot(expected_outcome: BlockVerificatio
 
 #[test]
 fn shutdown_stops_scheduler_with_block_in_progress() {
-    let stage = block_verification_stage();
+    let stage = run_scheduler(TEST_SCHEDULER_CONFIG);
 
     let session: BlockVerificationSession<Started> =
         stage.begin_block(BANK_ID, SLOT, BOGUS_HASH).unwrap();

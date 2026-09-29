@@ -7,9 +7,6 @@ use {
         },
         stage::BlockVerificationStage,
         utils::cancellation_token::{CancellationToken, CancellationTokenRef},
-        verification_components::{
-            entry_hash_verification::VerifyEntryHash, signature_verification::VerifySignature,
-        },
     },
     crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded},
     solana_clock::{BankId, Slot},
@@ -20,29 +17,16 @@ use {
 /// How long the event loop waits for a replay message before checking for shutdown.
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-pub(super) struct BlockVerificationScheduler<S, E> {
+pub(super) struct BlockVerificationScheduler {
     replay_message_receiver: Receiver<ReplayToBlockVerificationMessage>,
     replay_message_sender: Sender<BlockVerificationToReplayMessage>,
 
     shutdown_token_ref: CancellationTokenRef,
     blocks_in_progress: Vec<BlockVerificationState>,
-
-    #[expect(dead_code)]
-    signature_verifier: S,
-    #[expect(dead_code)]
-    entry_hash_verifier: E,
 }
 
-impl<S, E> BlockVerificationScheduler<S, E>
-where
-    S: VerifySignature + Send + 'static,
-    E: VerifyEntryHash + Send + 'static,
-{
-    pub(super) fn run_scheduler(
-        scheduler_config: SchedulerConfig,
-        signature_verifier: S,
-        entry_hash_verifier: E,
-    ) -> BlockVerificationStage {
+impl BlockVerificationScheduler {
+    pub(super) fn run_scheduler(scheduler_config: SchedulerConfig) -> BlockVerificationStage {
         let replay_to_block_verification =
             bounded(scheduler_config.replay_to_block_verification_channel_size);
         let block_verification_to_replay =
@@ -55,8 +39,6 @@ where
             replay_message_sender: block_verification_to_replay.0,
             shutdown_token_ref: shutdown_token.token_ref(),
             blocks_in_progress: Vec::new(),
-            signature_verifier,
-            entry_hash_verifier,
         };
 
         let scheduler_thread_join_handle =
@@ -69,13 +51,7 @@ where
             scheduler_thread_join_handle,
         )
     }
-}
 
-impl<S, E> BlockVerificationScheduler<S, E>
-where
-    S: VerifySignature,
-    E: VerifyEntryHash,
-{
     /// Runs until shutdown is requested or every replay message sender is dropped.
     ///
     /// Blocks still in progress are dropped on exit without an outcome being sent for them.
