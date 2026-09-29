@@ -240,61 +240,6 @@ fn reusing_bank_id_or_slot_in_progress_panics_scheduler(
     assert!(stage.shutdown().is_err());
 }
 
-// A started block is still in progress when dropped, so the abort sent on drop aborts it. A
-// block with no entries is verified as soon as all its entries are submitted, so the abort sent
-// on drop is ignored.
-#[test_case(BlockVerificationOutcome::Aborted; "started")]
-#[test_case(BlockVerificationOutcome::Verified; "all_entries_submitted")]
-fn dropping_session_releases_bank_id_and_slot(expected_outcome: BlockVerificationOutcome) {
-    let stage = run_scheduler(TEST_SCHEDULER_CONFIG);
-
-    let session: BlockVerificationSession<Started> =
-        stage.begin_block(BANK_ID, SLOT, BOGUS_HASH).unwrap();
-
-    match expected_outcome {
-        BlockVerificationOutcome::Aborted => drop(session),
-        BlockVerificationOutcome::Verified => {
-            let session: BlockVerificationSession<AllEntriesSubmitted> =
-                session.notify_all_entries_submitted().unwrap();
-            drop(session);
-        }
-        BlockVerificationOutcome::VerificationFailed => unreachable!(),
-    }
-
-    assert_eq!(
-        stage
-            .scheduler_message_receiver()
-            .recv_timeout(RECV_TIMEOUT)
-            .unwrap(),
-        BlockVerificationToReplayMessage {
-            slot: SLOT,
-            bank_id: BANK_ID,
-            verification_status: expected_outcome,
-        }
-    );
-
-    // The abort sent on drop is handled before the next begin, so the bank id and slot can be
-    // reused.
-    let session: BlockVerificationSession<Started> =
-        stage.begin_block(BANK_ID, SLOT, BOGUS_HASH).unwrap();
-    let _session: BlockVerificationSession<AllEntriesSubmitted> =
-        session.notify_all_entries_submitted().unwrap();
-
-    assert_eq!(
-        stage
-            .scheduler_message_receiver()
-            .recv_timeout(RECV_TIMEOUT)
-            .unwrap(),
-        BlockVerificationToReplayMessage {
-            slot: SLOT,
-            bank_id: BANK_ID,
-            verification_status: BlockVerificationOutcome::Verified,
-        }
-    );
-
-    stage.shutdown().unwrap();
-}
-
 #[test]
 fn shutdown_stops_scheduler_with_block_in_progress() {
     let stage = run_scheduler(TEST_SCHEDULER_CONFIG);

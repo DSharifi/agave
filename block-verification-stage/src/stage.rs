@@ -35,9 +35,6 @@
 //!
 //!   Every transition fails with an error if the scheduler has shut down.
 //!
-//!   Drop:
-//!     Started, AllEntriesSubmitted  ──► sends Abort
-//!     Aborted                       ──► nothing
 //! ```
 
 use {
@@ -156,21 +153,13 @@ impl BlockVerificationStage {
         bank_id: BankId,
         slot: Slot,
         parent_bank_last_entry_hash: Hash,
-    ) -> Result<BlockVerificationSession<Started>, BeginBlockError> {
-        let begin_message = ReplayToBlockVerificationMessage::Begin(BeginMessage {
+    ) -> Result<BlockVerificationSession<Started>, SchedulerShutdownError> {
+        BlockVerificationSession::try_new(
             bank_id,
-            parent_bank_last_entry_hash,
             slot,
-        });
-
-        self.replay_message_sender
-            .send(begin_message)
-            .map_err(|_err: SendError<_>| BeginBlockError::SchedulerShutDown)?;
-
-        Ok(BlockVerificationSession::new(
-            bank_id,
+            parent_bank_last_entry_hash,
             self.replay_message_sender.clone(),
-        ))
+        )
     }
 }
 
@@ -178,10 +167,11 @@ impl BlockVerificationStage {
 /// its outcome is received.
 ///
 /// `SchedulingState` is one of [`Started`], [`AllEntriesSubmitted`] or [`Aborted`]. Dropping
-/// the [`BlockVerificationSession`] aborts verification of the block.
+/// the [`BlockVerificationSession`] does not abort verification of the block.
 #[derive(Debug)]
 pub struct BlockVerificationSession<SchedulingState> {
-    sender: abort_on_drop::AbortOnDropSender,
+    bank_id: BankId,
+    replay_message_sender: Sender<ReplayToBlockVerificationMessage>,
     scheduling_state: PhantomData<fn() -> SchedulingState>,
 }
 
@@ -193,128 +183,77 @@ where
     pub fn abort_block_verification(
         self,
     ) -> Result<BlockVerificationSession<Aborted>, SchedulerShutdownError> {
-        let mut sender = self.sender;
-        sender.send_abort()?;
+        self.send(ReplayToBlockVerificationMessage::Abort(AbortMessage {
+            bank_id: self.bank_id,
+        }))?;
 
         Ok(BlockVerificationSession::<Aborted> {
-            sender,
+            bank_id: self.bank_id,
+            replay_message_sender: self.replay_message_sender,
             scheduling_state: PhantomData,
         })
     }
 }
 
+impl<SchedulingState> BlockVerificationSession<SchedulingState> {
+    fn send(
+        &self,
+        message: ReplayToBlockVerificationMessage,
+    ) -> Result<(), SchedulerShutdownError> {
+        self.replay_message_sender
+            .send(message)
+            .map_err(|_err: SendError<_>| SchedulerShutdownError)
+    }
+}
+
 impl BlockVerificationSession<Started> {
-    pub(crate) fn new(
+    pub(crate) fn try_new(
         bank_id: BankId,
+        slot: Slot,
+        parent_bank_last_entry_hash: Hash,
         replay_message_sender: Sender<ReplayToBlockVerificationMessage>,
-    ) -> Self {
-        Self {
-            sender: abort_on_drop::AbortOnDropSender::new(bank_id, replay_message_sender),
+    ) -> Result<Self, SchedulerShutdownError> {
+        let begin_message = ReplayToBlockVerificationMessage::Begin(BeginMessage {
+            bank_id,
+            parent_bank_last_entry_hash,
+            slot,
+        });
+
+        let session = Self {
+            bank_id,
+            replay_message_sender,
             scheduling_state: PhantomData,
-        }
+        };
+
+        session.send(begin_message)?;
+
+        Ok(session)
     }
 
     pub fn submit_entry(&self, entry_view: EntryView<Bytes>) -> Result<(), SchedulerShutdownError> {
-        self.sender.send_entry(entry_view)
+        self.send(ReplayToBlockVerificationMessage::Entry(EntryMessage {
+            bank_id: self.bank_id,
+            entry_view,
+        }))
     }
 
     /// Tells the scheduler that every entry of the block has been submitted.
     pub fn notify_all_entries_submitted(
         self,
     ) -> Result<BlockVerificationSession<AllEntriesSubmitted>, SchedulerShutdownError> {
-        self.sender.send_all_entries_submitted()?;
+        self.send(ReplayToBlockVerificationMessage::AllEntriesSubmitted(
+            AllEntriesSubmittedMessage {
+                bank_id: self.bank_id,
+            },
+        ))?;
 
         Ok(BlockVerificationSession::<AllEntriesSubmitted> {
-            sender: self.sender,
+            bank_id: self.bank_id,
+            replay_message_sender: self.replay_message_sender,
             scheduling_state: PhantomData,
         })
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum BeginBlockError {
-    SchedulerShutDown,
-    BankIdOccupied,
-    SlotIdOccupied,
-}
-
-#[derive(Debug, PartialEq, Eq)]
 pub struct SchedulerShutdownError;
-
-mod abort_on_drop {
-    use super::*;
-
-    /// Sends messages for one block to the scheduler.
-    ///
-    /// Sends `Abort` for `bank_id` when dropped unless disarmed.
-    #[derive(Debug)]
-    pub(super) struct AbortOnDropSender {
-        bank_id: BankId,
-        replay_message_sender: Sender<ReplayToBlockVerificationMessage>,
-        armed: bool,
-    }
-
-    impl AbortOnDropSender {
-        pub(super) fn new(
-            bank_id: BankId,
-            replay_message_sender: Sender<ReplayToBlockVerificationMessage>,
-        ) -> Self {
-            Self {
-                bank_id,
-                replay_message_sender,
-                armed: true,
-            }
-        }
-
-        pub(super) fn send_entry(
-            &self,
-            entry_view: EntryView<Bytes>,
-        ) -> Result<(), SchedulerShutdownError> {
-            self.send(ReplayToBlockVerificationMessage::Entry(EntryMessage {
-                bank_id: self.bank_id,
-                entry_view,
-            }))
-        }
-
-        pub(super) fn send_all_entries_submitted(&self) -> Result<(), SchedulerShutdownError> {
-            self.send(ReplayToBlockVerificationMessage::AllEntriesSubmitted(
-                AllEntriesSubmittedMessage {
-                    bank_id: self.bank_id,
-                },
-            ))
-        }
-
-        /// Sends `Abort` and disarms, so no second `Abort` is sent on drop.
-        pub(super) fn send_abort(&mut self) -> Result<(), SchedulerShutdownError> {
-            self.disarm();
-            self.send(ReplayToBlockVerificationMessage::Abort(AbortMessage {
-                bank_id: self.bank_id,
-            }))?;
-
-            Ok(())
-        }
-
-        /// Stops `Abort` from being sent on drop.
-        pub(super) fn disarm(&mut self) {
-            self.armed = false;
-        }
-
-        fn send(
-            &self,
-            message: ReplayToBlockVerificationMessage,
-        ) -> Result<(), SchedulerShutdownError> {
-            self.replay_message_sender
-                .send(message)
-                .map_err(|_err: SendError<_>| SchedulerShutdownError)
-        }
-    }
-
-    impl Drop for AbortOnDropSender {
-        fn drop(&mut self) {
-            if self.armed {
-                // An abort for a block the scheduler no longer tracks is ignored.
-                let _ = self.send_abort();
-            }
-        }
-    }
-}
