@@ -2,7 +2,6 @@ pub use {config::SchedulerConfig, stage::BlockVerificationStage};
 
 mod config;
 mod scheduler;
-mod utils;
 
 pub mod messages;
 pub mod stage;

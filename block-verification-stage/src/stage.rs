@@ -41,19 +41,23 @@
 //! ```
 
 use {
-    crate::{
-        messages::{
-            AbortMessage, AllEntriesSubmittedMessage, BeginMessage,
-            BlockVerificationToReplayMessage, EntryMessage, ReplayToBlockVerificationMessage,
-        },
-        utils::cancellation_token::CancellationToken,
+    crate::messages::{
+        AbortMessage, AllEntriesSubmittedMessage, BeginMessage, BlockVerificationToReplayMessage,
+        EntryMessage, ReplayToBlockVerificationMessage,
     },
     bytes::Bytes,
     crossbeam_channel::{Receiver, SendError, Sender},
     solana_clock::{BankId, Slot},
     solana_entry::entry::EntryView,
     solana_hash::Hash,
-    std::{marker::PhantomData, thread::JoinHandle},
+    std::{
+        marker::PhantomData,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread::JoinHandle,
+    },
 };
 
 /// A type-state used over [`BlockVerificationSession<Started>`] representing the state
@@ -103,7 +107,7 @@ pub struct BlockVerificationStage {
     replay_message_sender: Sender<ReplayToBlockVerificationMessage>,
     replay_message_receiver: Receiver<BlockVerificationToReplayMessage>,
     /// Signals the scheduler thread to exit when cancelled or dropped.
-    shutdown_token: CancellationToken,
+    shutdown_signal: Arc<AtomicBool>,
     scheduler_thread_join_handle: JoinHandle<()>,
 }
 
@@ -111,13 +115,13 @@ impl BlockVerificationStage {
     pub(crate) fn new(
         replay_message_sender: Sender<ReplayToBlockVerificationMessage>,
         replay_message_receiver: Receiver<BlockVerificationToReplayMessage>,
-        shutdown_token: CancellationToken,
+        shutdown_signal: Arc<AtomicBool>,
         scheduler_thread_join_handle: JoinHandle<()>,
     ) -> Self {
         Self {
             replay_message_sender,
             replay_message_receiver,
-            shutdown_token,
+            shutdown_signal,
             scheduler_thread_join_handle,
         }
     }
@@ -134,7 +138,7 @@ impl BlockVerificationStage {
     /// Blocks still in progress are dropped without an outcome being sent for them. Dropping the
     /// stage also stops the scheduler, but without waiting for the thread.
     pub fn shutdown(self) -> std::thread::Result<()> {
-        self.shutdown_token.cancel();
+        self.shutdown_signal.store(true, Ordering::Relaxed);
         self.scheduler_thread_join_handle.join()
     }
 

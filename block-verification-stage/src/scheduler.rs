@@ -6,12 +6,17 @@ use {
             BlockVerificationToReplayMessage, EntryMessage, ReplayToBlockVerificationMessage,
         },
         stage::BlockVerificationStage,
-        utils::cancellation_token::{CancellationToken, CancellationTokenRef},
     },
     crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded},
     solana_clock::{BankId, Slot},
     solana_hash::Hash,
-    std::time::Duration,
+    std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    },
 };
 
 /// How long the event loop waits for a replay message before checking for shutdown.
@@ -21,7 +26,7 @@ pub(super) struct BlockVerificationScheduler {
     replay_message_receiver: Receiver<ReplayToBlockVerificationMessage>,
     replay_message_sender: Sender<BlockVerificationToReplayMessage>,
 
-    shutdown_token_ref: CancellationTokenRef,
+    shutdown_signal: Arc<AtomicBool>,
     blocks_in_progress: Vec<BlockVerificationState>,
 }
 
@@ -32,12 +37,12 @@ impl BlockVerificationScheduler {
         let block_verification_to_replay =
             bounded(scheduler_config.block_verification_to_replay_channel_size);
 
-        let shutdown_token = CancellationToken::new();
+        let shutdown_signal = Arc::new(AtomicBool::new(false));
 
         let scheduler = Self {
             replay_message_receiver: replay_to_block_verification.1,
             replay_message_sender: block_verification_to_replay.0,
-            shutdown_token_ref: shutdown_token.token_ref(),
+            shutdown_signal: shutdown_signal.clone(),
             blocks_in_progress: Vec::new(),
         };
 
@@ -47,7 +52,7 @@ impl BlockVerificationScheduler {
         BlockVerificationStage::new(
             replay_to_block_verification.0,
             block_verification_to_replay.1,
-            shutdown_token,
+            shutdown_signal,
             scheduler_thread_join_handle,
         )
     }
@@ -57,7 +62,7 @@ impl BlockVerificationScheduler {
     /// Blocks still in progress are dropped on exit without an outcome being sent for them.
     /// Dropping the scheduler drops its outcome sender, disconnecting the stage's receiver.
     fn run_scheduler_event_loop(mut self) {
-        while !self.shutdown_token_ref.is_cancelled() {
+        while !self.shutdown_signal.load(Ordering::Relaxed) {
             match self
                 .replay_message_receiver
                 .recv_timeout(SHUTDOWN_POLL_INTERVAL)
@@ -192,8 +197,6 @@ struct BlockVerificationState {
     parent_bank_last_entry_hash: Hash,
     slot: Slot,
     progress_tracker: BlockVerificationStatus,
-    #[expect(dead_code)]
-    cancellation_token: CancellationToken,
 }
 
 impl BlockVerificationState {
@@ -203,7 +206,6 @@ impl BlockVerificationState {
             parent_bank_last_entry_hash,
             slot,
             progress_tracker: BlockVerificationStatus::default(),
-            cancellation_token: CancellationToken::new(),
         }
     }
 }
