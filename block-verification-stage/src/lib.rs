@@ -1,12 +1,11 @@
-pub use stage::BlockVerificationStage;
+pub use {config::SchedulerConfig, stage::BlockVerificationStage};
 
-#[expect(
-    dead_code,
-    reason = "the messages are handled by the scheduler in a follow-up"
-)]
+mod config;
+mod scheduler;
+
 pub mod messages;
-#[expect(
-    dead_code,
-    reason = "the stage is constructed by the scheduler in a follow-up"
-)]
 pub mod stage;
+
+pub fn run_scheduler(scheduler_config: SchedulerConfig) -> BlockVerificationStage {
+    scheduler::BlockVerificationScheduler::run_scheduler(scheduler_config)
+}
