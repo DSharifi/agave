@@ -1502,7 +1502,9 @@ dependencies = [
 name = "block-verification-stage"
 version = "5.0.0-alpha.0"
 dependencies = [
+ "bytes",
  "solana-clock",
+ "solana-entry",
  "solana-hash",
 ]
 
