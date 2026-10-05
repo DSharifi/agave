@@ -109,6 +109,10 @@ pub struct BlockVerificationStage {
 }
 
 impl BlockVerificationStage {
+    #[expect(
+        dead_code,
+        reason = "the stage is constructed by the scheduler in a follow-up"
+    )]
     pub(crate) fn new(
         replay_message_sender: Sender<ReplayToBlockVerificationMessage>,
         replay_message_receiver: Receiver<BlockVerificationToReplayMessage>,
