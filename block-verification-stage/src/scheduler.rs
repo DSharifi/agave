@@ -123,22 +123,24 @@ impl BlockVerificationScheduler {
     fn handle_entry_message(&mut self, _entry_message: EntryMessage) {}
 
     fn handle_abort_message(&mut self, AbortMessage { bank_id }: AbortMessage) {
-        // the block is not found if it already finished before the abort was handled.
-        if let Some(index) = self
+        let Some(index) = self
             .blocks_in_progress
             .iter()
             .position(|state| state.bank_id == bank_id)
-        {
-            let block_verification_state = self.blocks_in_progress.remove(index);
+        else {
+            // The block completed or failed verification before the abort message arrived
+            return;
+        };
 
-            let _ = self
-                .replay_message_sender
-                .send(BlockVerificationToReplayMessage {
-                    slot: block_verification_state.slot,
-                    bank_id: block_verification_state.bank_id,
-                    verification_status: BlockVerificationOutcome::Aborted,
-                });
-        }
+        let block_verification_state = self.blocks_in_progress.remove(index);
+
+        let _ = self
+            .replay_message_sender
+            .send(BlockVerificationToReplayMessage {
+                slot: block_verification_state.slot,
+                bank_id: block_verification_state.bank_id,
+                verification_status: BlockVerificationOutcome::Aborted,
+            });
     }
 
     fn handle_all_entries_submitted_message(
@@ -150,7 +152,7 @@ impl BlockVerificationScheduler {
             .iter()
             .position(|state| state.bank_id == bank_id)
         else {
-            // this can happen if it was removed due to failing verification
+            // The block already failed verification
             return;
         };
 
