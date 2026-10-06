@@ -123,15 +123,10 @@ impl BlockVerificationScheduler {
     fn handle_entry_message(&mut self, _entry_message: EntryMessage) {}
 
     fn handle_abort_message(&mut self, AbortMessage { bank_id }: AbortMessage) {
-        let Some(block_verification_state_index) = self.block_verification_state_index(&bank_id)
-        else {
+        let Some(block_verification_state) = self.take_block_verification_state(&bank_id) else {
             // The block completed or failed verification before the abort message arrived
             return;
         };
-
-        let block_verification_state = self
-            .blocks_in_progress
-            .swap_remove(block_verification_state_index);
 
         let _ = self
             .replay_message_sender
@@ -146,52 +141,50 @@ impl BlockVerificationScheduler {
         &mut self,
         AllEntriesSubmittedMessage { bank_id }: AllEntriesSubmittedMessage,
     ) {
-        let Some(block_verification_state_index) = self.block_verification_state_index(&bank_id)
+        let Some(mut block_verification_state) = self.take_block_verification_state(&bank_id)
         else {
             // The block already failed verification
             return;
         };
 
-        self.blocks_in_progress[block_verification_state_index]
+        block_verification_state
             .progress_tracker
             .all_entries_are_submitted = true;
 
-        self.try_finish_completed_bank(block_verification_state_index);
+        self.try_complete_block(block_verification_state);
     }
 
-    /// Checks if block verification is completed for the bank at `block_verification_state_index`.
-    /// If it is completed, the bank id is removed from the scheduler state and a
-    /// [`BlockVerificationOutcome::Verified`] message is sent back to replay.
-    ///
-    /// # Panics
-    /// Panics if `block_verification_state_index` is not an index in `self.blocks_in_progress`;
-    fn try_finish_completed_bank(&mut self, block_verification_state_index: usize) {
-        let state = self
+    /// Takes the state of the block being verified in `bank_id` out of the scheduler state.
+    fn take_block_verification_state(
+        &mut self,
+        bank_id: &BankId,
+    ) -> Option<BlockVerificationState> {
+        let block_verification_state_index = self
             .blocks_in_progress
-            .get(block_verification_state_index)
-            .expect("caller guarantees index is valid");
-
-        if !state.progress_tracker.is_completed() {
-            return;
-        }
-
-        let block_verification_state = self
-            .blocks_in_progress
-            .swap_remove(block_verification_state_index);
-
-        let _ = self
-            .replay_message_sender
-            .send(BlockVerificationToReplayMessage {
-                slot: block_verification_state.slot,
-                bank_id: block_verification_state.bank_id,
-                verification_status: BlockVerificationOutcome::Verified,
-            });
-    }
-
-    fn block_verification_state_index(&self, bank_id: &BankId) -> Option<usize> {
-        self.blocks_in_progress
             .iter()
-            .position(|state| state.bank_id == *bank_id)
+            .position(|state| state.bank_id == *bank_id)?;
+
+        Some(
+            self.blocks_in_progress
+                .swap_remove(block_verification_state_index),
+        )
+    }
+
+    /// Sends a [`BlockVerificationOutcome::Verified`] message back to replay if every verification
+    /// operation of `block_verification_state` has finished, and returns the state to the
+    /// scheduler otherwise.
+    fn try_complete_block(&mut self, block_verification_state: BlockVerificationState) {
+        if block_verification_state.progress_tracker.is_completed() {
+            let _ = self
+                .replay_message_sender
+                .send(BlockVerificationToReplayMessage {
+                    slot: block_verification_state.slot,
+                    bank_id: block_verification_state.bank_id,
+                    verification_status: BlockVerificationOutcome::Verified,
+                });
+        } else {
+            self.blocks_in_progress.push(block_verification_state);
+        }
     }
 }
 
