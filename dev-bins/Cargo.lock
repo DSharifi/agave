@@ -556,6 +556,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-worker-pool"
+version = "4.4.0-alpha.5"
+dependencies = [
+ "atomic-wait",
+ "crossbeam-channel",
+ "crossbeam-utils",
+ "log",
+]
+
+[[package]]
 name = "agave-xdp"
 version = "4.4.0-alpha.5"
 dependencies = [
@@ -7078,16 +7088,15 @@ dependencies = [
  "agave-snapshots",
  "agave-transaction-view",
  "agave-votor-messages",
+ "agave-worker-pool",
  "anyhow",
  "assert_matches",
- "atomic-wait",
  "bitflags 2.13.2",
  "bytes",
  "bzip2",
  "chrono",
  "chrono-humanize",
  "crossbeam-channel",
- "crossbeam-utils",
  "dashmap",
  "eager",
  "fs_extra",

@@ -1,0 +1,33 @@
+[package]
+name = "agave-worker-pool"
+description = "Agave worker thread pool"
+documentation = "https://docs.rs/agave-worker-pool"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
+rustdoc-args = ["--cfg=docsrs"]
+
+[features]
+agave-unstable-api = []
+shuttle-test = ["dep:shuttle"]
+
+[dependencies]
+atomic-wait = { workspace = true }
+crossbeam-channel = { workspace = true }
+crossbeam-utils = { workspace = true }
+log = { workspace = true }
+shuttle = { workspace = true, optional = true }
+
+[dev-dependencies]
+agave-worker-pool = { path = ".", features = ["agave-unstable-api"] }
+
+[lints]
+workspace = true
