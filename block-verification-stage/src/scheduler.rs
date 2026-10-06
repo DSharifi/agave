@@ -210,14 +210,10 @@ impl BlockVerificationState {
 #[derive(Default)]
 struct BlockVerificationStatus {
     all_entries_are_submitted: bool,
-    sig_verify_operations_in_progress: u64,
-    entry_hash_verification_operations_in_progress: u64,
 }
 
 impl BlockVerificationStatus {
     fn is_completed(&self) -> bool {
-        self.sig_verify_operations_in_progress == 0
-            && self.entry_hash_verification_operations_in_progress == 0
-            && self.all_entries_are_submitted
+        self.all_entries_are_submitted
     }
 }
