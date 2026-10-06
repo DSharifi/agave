@@ -132,7 +132,7 @@ impl BlockVerificationScheduler {
             return;
         };
 
-        let block_verification_state = self.blocks_in_progress.remove(index);
+        let block_verification_state = self.blocks_in_progress.swap_remove(index);
 
         let _ = self
             .replay_message_sender
@@ -181,7 +181,7 @@ impl BlockVerificationScheduler {
 
         let block_verification_state = self
             .blocks_in_progress
-            .remove(block_verification_state_index);
+            .swap_remove(block_verification_state_index);
 
         let _ = self
             .replay_message_sender
