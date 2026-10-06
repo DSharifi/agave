@@ -123,16 +123,15 @@ impl BlockVerificationScheduler {
     fn handle_entry_message(&mut self, _entry_message: EntryMessage) {}
 
     fn handle_abort_message(&mut self, AbortMessage { bank_id }: AbortMessage) {
-        let Some(index) = self
-            .blocks_in_progress
-            .iter()
-            .position(|state| state.bank_id == bank_id)
+        let Some(block_verification_state_index) = self.block_verification_state_index(&bank_id)
         else {
             // The block completed or failed verification before the abort message arrived
             return;
         };
 
-        let block_verification_state = self.blocks_in_progress.swap_remove(index);
+        let block_verification_state = self
+            .blocks_in_progress
+            .swap_remove(block_verification_state_index);
 
         let _ = self
             .replay_message_sender
@@ -147,10 +146,7 @@ impl BlockVerificationScheduler {
         &mut self,
         AllEntriesSubmittedMessage { bank_id }: AllEntriesSubmittedMessage,
     ) {
-        let Some(block_verification_state_index) = self
-            .blocks_in_progress
-            .iter()
-            .position(|state| state.bank_id == bank_id)
+        let Some(block_verification_state_index) = self.block_verification_state_index(&bank_id)
         else {
             // The block already failed verification
             return;
@@ -190,6 +186,12 @@ impl BlockVerificationScheduler {
                 bank_id: block_verification_state.bank_id,
                 verification_status: BlockVerificationOutcome::Verified,
             });
+    }
+
+    fn block_verification_state_index(&self, bank_id: &BankId) -> Option<usize> {
+        self.blocks_in_progress
+            .iter()
+            .position(|state| state.bank_id == *bank_id)
     }
 }
 
