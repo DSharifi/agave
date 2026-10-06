@@ -1503,6 +1503,7 @@ name = "block-verification-stage"
 version = "5.0.0-alpha.0"
 dependencies = [
  "bytes",
+ "crossbeam-channel",
  "solana-clock",
  "solana-entry",
  "solana-hash",
