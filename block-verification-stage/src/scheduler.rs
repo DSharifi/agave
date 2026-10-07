@@ -79,7 +79,7 @@ impl BlockVerificationScheduler {
                     }
                 }
                 recv(flush_buffered_replay_responses_tick) -> _ => {
-                    self.flush_buffered_replay_responses();
+                    self.try_flush_buffered_replay_responses();
                 }
                 recv(self.replay_message_receiver) -> replay_message => {
                     match replay_message {
@@ -91,8 +91,9 @@ impl BlockVerificationScheduler {
         }
     }
 
-    /// Sends buffered replay responses
-    fn flush_buffered_replay_responses(&mut self) {
+    /// Sends buffered replay responses without blocking, stopping at the first
+    /// failed send. Any remaining responses stay buffered until the next flush.
+    fn try_flush_buffered_replay_responses(&mut self) {
         while let Some(message) = self.buffered_replay_response_messages.pop_front() {
             match self.replay_message_sender.try_send(message) {
                 Ok(()) => {}
@@ -165,7 +166,7 @@ impl BlockVerificationScheduler {
                 bank_id: block_verification_state.bank_id,
                 verification_status: BlockVerificationOutcome::Aborted,
             });
-        self.flush_buffered_replay_responses();
+        self.try_flush_buffered_replay_responses();
     }
 
     fn handle_all_entries_submitted_message(
@@ -212,7 +213,7 @@ impl BlockVerificationScheduler {
                     bank_id: block_verification_state.bank_id,
                     verification_status: BlockVerificationOutcome::Verified,
                 });
-            self.flush_buffered_replay_responses();
+            self.try_flush_buffered_replay_responses();
         } else {
             self.blocks_in_progress.push(block_verification_state);
         }
