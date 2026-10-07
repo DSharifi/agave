@@ -53,7 +53,7 @@ fn block_with_no_entries_notifying_that_all_entries_are_submitted_passes_verific
     );
 
     shutdown_flag.store(true, Ordering::Relaxed);
-    stage.join().unwrap();
+    assert_matches!(stage.join(), Ok(()));
 }
 
 #[test]
@@ -96,7 +96,7 @@ fn aborting_block_before_all_entries_submitted_sends_aborted_and_releases_bank_i
     );
 
     shutdown_flag.store(true, Ordering::Relaxed);
-    stage.join().unwrap();
+    assert_matches!(stage.join(), Ok(()));
 }
 
 // The block with no entries is verified as soon as all its entries are submitted, so the
@@ -147,7 +147,7 @@ fn aborting_block_after_it_completed_is_ignored() {
     );
 
     shutdown_flag.store(true, Ordering::Relaxed);
-    stage.join().unwrap();
+    assert_matches!(stage.join(), Ok(()));
 }
 
 #[test]
@@ -218,7 +218,7 @@ fn outcomes_of_concurrent_blocks_are_sent_in_completion_order() {
     );
 
     shutdown_flag.store(true, Ordering::Relaxed);
-    stage.join().unwrap();
+    assert_matches!(stage.join(), Ok(()));
 }
 
 // Beginning a block whose bank id or slot is still in progress violates a scheduler invariant,
@@ -226,6 +226,7 @@ fn outcomes_of_concurrent_blocks_are_sent_in_completion_order() {
 #[test_case(1, 120, 1, 121; "reused_bank_id")]
 #[test_case(1, 120, 2, 120; "reused_slot")]
 #[test_case(1, 120, 1, 120; "reused_slot_and_bank_id")]
+#[should_panic = "internal invariant violated. A duplicate"]
 fn reusing_bank_id_or_slot_in_progress_panics_scheduler(
     first_bank_id: BankId,
     first_slot: Slot,
@@ -267,7 +268,7 @@ fn shutdown_stops_scheduler_with_block_in_progress() {
 
     // The session still holds a sender, so only the shutdown signal stops the scheduler.
     shutdown_flag.store(true, Ordering::Relaxed);
-    stage.join().unwrap();
+    assert_matches!(stage.join(), Ok(()));
 
     assert_matches!(
         session.notify_all_entries_submitted(),

@@ -1368,6 +1368,7 @@ dependencies = [
  "solana-entry",
  "solana-hash",
  "test-case",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
