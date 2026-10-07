@@ -7,10 +7,11 @@ use {
         },
         stage::BlockVerificationStage,
     },
-    crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded},
+    crossbeam_channel::{Receiver, RecvError, Sender, bounded, select_biased},
     solana_clock::{BankId, Slot},
     solana_hash::Hash,
     std::{
+        collections::VecDeque,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -21,13 +22,16 @@ use {
 
 /// How long the event loop waits for a replay message before checking for shutdown.
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const FLUSH_BUFFERED_REPLAY_RESPONSES_INTERVAL: Duration = Duration::from_millis(10);
 
 pub(super) struct BlockVerificationScheduler {
     replay_message_receiver: Receiver<ReplayToBlockVerificationMessage>,
     replay_message_sender: Sender<BlockVerificationToReplayMessage>,
 
     shutdown_signal: Arc<AtomicBool>,
+
     blocks_in_progress: Vec<BlockVerificationState>,
+    buffered_replay_response_messages: VecDeque<BlockVerificationToReplayMessage>,
 }
 
 impl BlockVerificationScheduler {
@@ -45,6 +49,7 @@ impl BlockVerificationScheduler {
             replay_message_sender: block_verification_to_replay.0,
             shutdown_signal: shutdown_signal.clone(),
             blocks_in_progress: Vec::new(),
+            buffered_replay_response_messages: VecDeque::new(),
         };
 
         let scheduler_thread_join_handle =
@@ -62,14 +67,40 @@ impl BlockVerificationScheduler {
     /// Blocks still in progress are dropped on exit without an outcome being sent for them.
     /// Dropping the scheduler drops its outcome sender, disconnecting the stage's receiver.
     fn run_scheduler_event_loop(mut self) {
-        while !self.shutdown_signal.load(Ordering::Relaxed) {
-            match self
-                .replay_message_receiver
-                .recv_timeout(SHUTDOWN_POLL_INTERVAL)
-            {
-                Ok(replay_message) => self.handle_replay_message(replay_message),
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
+        let check_for_shutdown_tick = crossbeam_channel::tick(SHUTDOWN_POLL_INTERVAL);
+        let flush_buffered_replay_responses_tick =
+            crossbeam_channel::tick(FLUSH_BUFFERED_REPLAY_RESPONSES_INTERVAL);
+
+        loop {
+            select_biased! {
+                recv(check_for_shutdown_tick) -> _ => {
+                    if self.shutdown_signal.load(Ordering::Relaxed) {
+                        return
+                    }
+                }
+                recv(flush_buffered_replay_responses_tick) -> _ => {
+                    self.flush_buffered_replay_responses();
+                }
+                recv(self.replay_message_receiver) -> replay_message => {
+                    match replay_message {
+                        Ok(replay_message) => self.handle_replay_message(replay_message),
+                        Err(RecvError) => return,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sends buffered replay responses
+    fn flush_buffered_replay_responses(&mut self) {
+        while let Some(message) = self.buffered_replay_response_messages.pop_front() {
+            match self.replay_message_sender.try_send(message) {
+                Ok(()) => {}
+                Err(send_error) => {
+                    self.buffered_replay_response_messages
+                        .push_front(send_error.into_inner());
+                    break;
+                }
             }
         }
     }
@@ -128,13 +159,13 @@ impl BlockVerificationScheduler {
             return;
         };
 
-        let _ = self
-            .replay_message_sender
-            .send(BlockVerificationToReplayMessage {
+        self.buffered_replay_response_messages
+            .push_back(BlockVerificationToReplayMessage {
                 slot: block_verification_state.slot,
                 bank_id: block_verification_state.bank_id,
                 verification_status: BlockVerificationOutcome::Aborted,
             });
+        self.flush_buffered_replay_responses();
     }
 
     fn handle_all_entries_submitted_message(
@@ -175,13 +206,13 @@ impl BlockVerificationScheduler {
     /// scheduler otherwise.
     fn try_complete_block(&mut self, block_verification_state: BlockVerificationState) {
         if block_verification_state.progress_tracker.is_completed() {
-            let _ = self
-                .replay_message_sender
-                .send(BlockVerificationToReplayMessage {
+            self.buffered_replay_response_messages
+                .push_back(BlockVerificationToReplayMessage {
                     slot: block_verification_state.slot,
                     bank_id: block_verification_state.bank_id,
                     verification_status: BlockVerificationOutcome::Verified,
                 });
+            self.flush_buffered_replay_responses();
         } else {
             self.blocks_in_progress.push(block_verification_state);
         }
