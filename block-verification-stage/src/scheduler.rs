@@ -7,7 +7,7 @@ use {
         },
         stage::BlockVerificationStage,
     },
-    crossbeam_channel::{Receiver, RecvError, Sender, TrySendError, bounded, select_biased},
+    crossbeam_channel::{Receiver, RecvError, Sender, TrySendError, bounded, select},
     solana_clock::{BankId, Slot},
     solana_hash::Hash,
     std::{
@@ -20,9 +20,8 @@ use {
     },
 };
 
-/// How long the event loop waits for a replay message before checking for shutdown.
-const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const FLUSH_BUFFERED_REPLAY_RESPONSES_INTERVAL: Duration = Duration::from_millis(10);
+/// The timeout used on waiting for messages before checking for a timeout
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(thiserror::Error, Debug)]
 pub enum SchedulerExitReason {
@@ -81,26 +80,19 @@ impl BlockVerificationScheduler {
     /// Blocks still in progress are dropped on exit without an outcome being sent for them.
     /// Dropping the scheduler drops its outcome sender, disconnecting the stage's receiver.
     fn run_scheduler_event_loop(mut self) -> Result<(), SchedulerExitReason> {
-        let check_for_shutdown_tick = crossbeam_channel::tick(SHUTDOWN_POLL_INTERVAL);
-        let flush_buffered_replay_responses_tick =
-            crossbeam_channel::tick(FLUSH_BUFFERED_REPLAY_RESPONSES_INTERVAL);
+        while !self.shutdown_signal.load(Ordering::Relaxed) {
+            self.try_flush_buffered_replay_responses()?;
 
-        loop {
-            select_biased! {
-                recv(check_for_shutdown_tick) -> _ => {
-                    if self.shutdown_signal.load(Ordering::Relaxed) {
-                        return Ok(());
-                    }
-                }
-                recv(flush_buffered_replay_responses_tick) -> _ => {
-                    self.try_flush_buffered_replay_responses()?;
-                }
+            select! {
                 recv(self.replay_message_receiver) -> replay_message => {
                     let replay_message = replay_message.map_err(|_: RecvError| SchedulerExitReason::DisconnectedResponseChannel)?;
                     let () = self.handle_replay_message(replay_message)?;
                 }
+                default(SHUTDOWN_POLL_INTERVAL) => {},
             }
         }
+
+        Ok(())
     }
 
     /// Sends buffered replay responses without blocking, stopping at the first
