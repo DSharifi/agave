@@ -87,17 +87,14 @@ impl BlockVerificationScheduler {
                 entry_hash_verification_response_sender,
             );
 
-        let scheduler = Self {
-            replay_message_receiver: replay_to_block_verification.1,
-            replay_message_sender: block_verification_to_replay.0,
+        let scheduler = Self::new(
+            replay_to_block_verification.1,
+            block_verification_to_replay.0,
             entry_hash_verification_request_producer,
             entry_hash_verification_response_receiver,
             shutdown_signal,
-            verification_session_id_generator: VerificationSessionIdGenerator::new(),
-            blocks_in_progress: Vec::new(),
-            buffered_replay_response_messages: VecDeque::new(),
             entry_hash_verification_workers,
-        };
+        );
 
         let scheduler_thread_join_handle =
             std::thread::spawn(move || scheduler.run_scheduler_event_loop());
@@ -107,6 +104,27 @@ impl BlockVerificationScheduler {
             block_verification_to_replay.1,
             scheduler_thread_join_handle,
         )
+    }
+
+    fn new(
+        replay_message_receiver: Receiver<ReplayToBlockVerificationMessage>,
+        replay_message_sender: Sender<BlockVerificationToReplayMessage>,
+        entry_hash_verification_request_producer: mpmc::Producer<EntryHashVerificationRequest>,
+        entry_hash_verification_response_receiver: Receiver<EntryHashVerificationResponse>,
+        shutdown_signal: Arc<AtomicBool>,
+        entry_hash_verification_workers: EntryHashVerificationWorkers,
+    ) -> Self {
+        Self {
+            replay_message_receiver,
+            replay_message_sender,
+            entry_hash_verification_request_producer,
+            entry_hash_verification_response_receiver,
+            shutdown_signal,
+            verification_session_id_generator: VerificationSessionIdGenerator::new(),
+            blocks_in_progress: Vec::new(),
+            buffered_replay_response_messages: VecDeque::new(),
+            entry_hash_verification_workers,
+        }
     }
 
     /// Runs until shutdown is requested, or any of the channels to replay or the workers disconnect.
@@ -389,6 +407,7 @@ impl BlockVerificationState {
     }
 }
 
+#[derive(Debug)]
 struct DisconnectedResponseChannel;
 
 #[derive(Default)]
@@ -400,5 +419,251 @@ struct BlockVerificationStatus {
 impl BlockVerificationStatus {
     fn is_completed(&self) -> bool {
         self.all_entries_are_submitted && self.entry_hash_jobs_in_flight == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::messages::EntryMessage,
+        bytes::Bytes,
+        crossbeam_channel::{TryRecvError, never},
+        solana_entry::entry::{
+            EntryVerificationData, EntryView, entry_views_for_tests, next_entry_mut,
+        },
+        test_case::test_case,
+    };
+
+    const BOGUS_HASH: Hash = Hash::new_from_array([1; _]);
+    const PARENT_BANK_LAST_ENTRY_HASH: Hash = Hash::new_from_array([2; _]);
+    const BANK_ID: BankId = 123;
+    const SLOT: Slot = 120;
+
+    struct ManuallyDrivenScheduler {
+        scheduler: BlockVerificationScheduler,
+        entry_hash_verification_request_consumer: mpmc::Consumer<EntryHashVerificationRequest>,
+        outcome_receiver: Receiver<BlockVerificationToReplayMessage>,
+    }
+
+    impl ManuallyDrivenScheduler {
+        fn new() -> Self {
+            let (
+                entry_hash_verification_request_producer,
+                entry_hash_verification_request_consumer,
+            ) = mpmc::pair(64).unwrap();
+            let (outcome_sender, outcome_receiver) = bounded(64);
+
+            // The handlers are called directly, so nothing is ever received on these channels.
+            let message_receiver = never();
+            let entry_hash_verification_response_receiver = never();
+
+            let scheduler = BlockVerificationScheduler::new(
+                message_receiver,
+                outcome_sender,
+                entry_hash_verification_request_producer,
+                entry_hash_verification_response_receiver,
+                Arc::new(AtomicBool::new(false)),
+                EntryHashVerificationWorkers::none(),
+            );
+
+            Self {
+                scheduler,
+                entry_hash_verification_request_consumer,
+                outcome_receiver,
+            }
+        }
+
+        fn begin_block(&mut self, bank_id: BankId, slot: Slot, parent_bank_last_entry_hash: Hash) {
+            self.handle_message(ReplayToBlockVerificationMessage::Begin(BeginMessage {
+                bank_id,
+                parent_bank_last_entry_hash,
+                slot,
+            }));
+        }
+
+        fn submit_entries(&mut self, bank_id: BankId, entry_views: Vec<EntryView<Bytes>>) {
+            for entry_view in entry_views {
+                self.handle_message(ReplayToBlockVerificationMessage::Entry(EntryMessage {
+                    bank_id,
+                    entry_view,
+                }));
+            }
+        }
+
+        fn notify_all_entries_submitted(&mut self, bank_id: BankId) {
+            self.handle_message(ReplayToBlockVerificationMessage::AllEntriesSubmitted(
+                AllEntriesSubmittedMessage { bank_id },
+            ));
+        }
+
+        fn abort_block(&mut self, bank_id: BankId) {
+            self.handle_message(ReplayToBlockVerificationMessage::Abort(AbortMessage {
+                bank_id,
+            }));
+        }
+
+        fn handle_message(&mut self, message: ReplayToBlockVerificationMessage) {
+            self.scheduler.handle_replay_message(message).unwrap();
+        }
+
+        fn take_entry_hash_verification_requests(&mut self) -> Vec<EntryHashVerificationRequest> {
+            std::iter::from_fn(|| self.entry_hash_verification_request_consumer.try_read())
+                .collect()
+        }
+
+        fn verify_entry_hash_and_respond(&mut self, request: EntryHashVerificationRequest) {
+            let verified =
+                EntryVerificationData::from(&request.entry_view).verify(&request.start_hash);
+            self.scheduler
+                .handle_entry_hash_verification_response(EntryHashVerificationResponse {
+                    block_verification_id: request.block_verification_id,
+                    verified,
+                })
+                .unwrap();
+        }
+
+        fn try_recv_outcome(&self) -> Option<BlockVerificationToReplayMessage> {
+            match self.outcome_receiver.try_recv() {
+                Ok(outcome) => Some(outcome),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => {
+                    panic!("the outcome sender is owned by the scheduler")
+                }
+            }
+        }
+    }
+
+    fn ticks_following(start_hash: Hash, num_ticks: usize) -> Vec<EntryView<Bytes>> {
+        let mut hash = start_hash;
+        let ticks = (0..num_ticks)
+            .map(|_| next_entry_mut(&mut hash, 1, vec![]))
+            .collect();
+        entry_views_for_tests(ticks)
+    }
+
+    fn outcome(
+        bank_id: BankId,
+        slot: Slot,
+        verification_status: BlockVerificationOutcome,
+    ) -> Option<BlockVerificationToReplayMessage> {
+        Some(BlockVerificationToReplayMessage {
+            slot,
+            bank_id,
+            verification_status,
+        })
+    }
+
+    #[test]
+    fn all_entries_submitted_does_not_complete_block_with_verifications_in_flight() {
+        let mut scheduler = ManuallyDrivenScheduler::new();
+
+        // Only the first entry is invalid, as the chain does not follow the parent bank's hash.
+        scheduler.begin_block(BANK_ID, SLOT, BOGUS_HASH);
+        scheduler.submit_entries(BANK_ID, ticks_following(PARENT_BANK_LAST_ENTRY_HASH, 3));
+        let [invalid_entry_request, second_request, third_request] = scheduler
+            .take_entry_hash_verification_requests()
+            .try_into()
+            .unwrap();
+
+        scheduler.verify_entry_hash_and_respond(third_request);
+        scheduler.verify_entry_hash_and_respond(second_request);
+        scheduler.notify_all_entries_submitted(BANK_ID);
+        assert_eq!(
+            scheduler.try_recv_outcome(),
+            None,
+            "a block must not complete while verifications are in flight"
+        );
+
+        scheduler.verify_entry_hash_and_respond(invalid_entry_request);
+        assert_eq!(
+            scheduler.try_recv_outcome(),
+            outcome(BANK_ID, SLOT, BlockVerificationOutcome::VerificationFailed),
+            "an invalid entry must fail the block regardless of response order"
+        );
+    }
+
+    #[test]
+    fn responses_in_flight_for_failed_block_are_ignored() {
+        let mut scheduler = ManuallyDrivenScheduler::new();
+
+        // Corrupting the hash of the first entry fails both its own verification and that of the
+        // second entry, which is verified against the corrupted hash. The third entry is valid.
+        let mut entries = ticks_following(PARENT_BANK_LAST_ENTRY_HASH, 3);
+        entries[0].hash = BOGUS_HASH;
+
+        scheduler.begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH);
+        scheduler.submit_entries(BANK_ID, entries);
+        let [
+            first_invalid_entry_request,
+            second_invalid_entry_request,
+            valid_entry_request,
+        ] = scheduler
+            .take_entry_hash_verification_requests()
+            .try_into()
+            .unwrap();
+
+        scheduler.verify_entry_hash_and_respond(first_invalid_entry_request);
+        assert_eq!(
+            scheduler.try_recv_outcome(),
+            outcome(BANK_ID, SLOT, BlockVerificationOutcome::VerificationFailed),
+            "a block must fail without waiting for verifications in flight"
+        );
+
+        scheduler.verify_entry_hash_and_respond(second_invalid_entry_request);
+        scheduler.verify_entry_hash_and_respond(valid_entry_request);
+        assert_eq!(
+            scheduler.try_recv_outcome(),
+            None,
+            "a failed block must not get another outcome from its remaining verifications"
+        );
+    }
+
+    // The responses of jobs in flight for an aborted block arrive after a later block reusing its
+    // bank id and slot has begun. Both a valid and an invalid response for the aborted block must
+    // be ignored, rather than completing or failing the later block.
+    #[test_case(PARENT_BANK_LAST_ENTRY_HASH, BOGUS_HASH, BlockVerificationOutcome::VerificationFailed; "valid_aborted_response")]
+    #[test_case(BOGUS_HASH, PARENT_BANK_LAST_ENTRY_HASH, BlockVerificationOutcome::Verified; "invalid_aborted_response")]
+    fn responses_of_aborted_block_are_ignored_by_later_block_reusing_its_bank_id(
+        aborted_block_parent_bank_last_entry_hash: Hash,
+        later_block_parent_bank_last_entry_hash: Hash,
+        later_block_outcome: BlockVerificationOutcome,
+    ) {
+        let mut scheduler = ManuallyDrivenScheduler::new();
+
+        scheduler.begin_block(BANK_ID, SLOT, aborted_block_parent_bank_last_entry_hash);
+        scheduler.submit_entries(BANK_ID, ticks_following(PARENT_BANK_LAST_ENTRY_HASH, 1));
+        scheduler.abort_block(BANK_ID);
+        assert_eq!(
+            scheduler.try_recv_outcome(),
+            outcome(BANK_ID, SLOT, BlockVerificationOutcome::Aborted),
+            "an abort must not wait for verifications in flight"
+        );
+        let [aborted_block_request] = scheduler
+            .take_entry_hash_verification_requests()
+            .try_into()
+            .unwrap();
+
+        scheduler.begin_block(BANK_ID, SLOT, later_block_parent_bank_last_entry_hash);
+        scheduler.submit_entries(BANK_ID, ticks_following(PARENT_BANK_LAST_ENTRY_HASH, 1));
+        scheduler.notify_all_entries_submitted(BANK_ID);
+        let [later_block_request] = scheduler
+            .take_entry_hash_verification_requests()
+            .try_into()
+            .unwrap();
+
+        scheduler.verify_entry_hash_and_respond(aborted_block_request);
+        assert_eq!(
+            scheduler.try_recv_outcome(),
+            None,
+            "responses for an aborted block must not affect a later block with the same bank id"
+        );
+
+        scheduler.verify_entry_hash_and_respond(later_block_request);
+        assert_eq!(
+            scheduler.try_recv_outcome(),
+            outcome(BANK_ID, SLOT, later_block_outcome),
+            "a block's outcome must depend only on its own entries"
+        );
     }
 }

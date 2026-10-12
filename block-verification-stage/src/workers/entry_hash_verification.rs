@@ -47,6 +47,14 @@ impl EntryHashVerificationWorkers {
         Self { worker_handles }
     }
 
+    /// No worker threads, for tests that act as the workers themselves.
+    #[cfg(test)]
+    pub(crate) fn none() -> Self {
+        Self {
+            worker_handles: Vec::new(),
+        }
+    }
+
     pub(crate) fn join_workers(self) {
         for worker_handle in self.worker_handles {
             let () = join_thread(worker_handle);

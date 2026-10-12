@@ -2,9 +2,7 @@ use {
     block_verification_stage::{
         BlockVerificationStage, SchedulerConfig,
         messages::BlockVerificationToReplayMessage,
-        stage::{
-            BlockVerificationSession, Started,
-        },
+        stage::{BlockVerificationSession, Started},
     },
     bytes::Bytes,
     solana_clock::{BankId, Slot},
@@ -13,10 +11,7 @@ use {
     solana_keypair::Keypair,
     solana_signer::Signer,
     solana_system_transaction as system_transaction,
-    std::{
-        num::NonZeroUsize,
-        time::Duration,
-    },
+    std::{num::NonZeroUsize, time::Duration},
 };
 
 pub const TEST_SCHEDULER_CONFIG: SchedulerConfig = SchedulerConfig {
