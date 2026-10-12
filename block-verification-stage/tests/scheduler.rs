@@ -1,4 +1,8 @@
 use {
+    crate::helpers::{
+        BOGUS_HASH, PARENT_BANK_LAST_ENTRY_HASH, RECV_TIMEOUT, SLOT, TEST_SCHEDULER_CONFIG,
+        entry_views_for_chain, recv_outcome, submit_entries,
+    },
     block_verification_stage::{
         SchedulerConfig,
         messages::{BlockVerificationOutcome, BlockVerificationToReplayMessage},
@@ -8,27 +12,20 @@ use {
         },
     },
     crossbeam_channel::RecvTimeoutError,
+    helpers::BANK_ID,
     solana_clock::{BankId, Slot},
-    solana_hash::Hash,
     std::{
         assert_matches,
+        num::NonZeroUsize,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
         },
-        time::Duration,
     },
     test_case::test_case,
 };
 
-const TEST_SCHEDULER_CONFIG: SchedulerConfig = SchedulerConfig {
-    replay_to_block_verification_channel_size: 10,
-    block_verification_to_replay_channel_size: 10,
-};
-const BOGUS_HASH: Hash = Hash::new_from_array([1; _]);
-const BANK_ID: BankId = 123;
-const SLOT: Slot = 120;
-const RECV_TIMEOUT: Duration = Duration::from_secs(5);
+pub mod helpers;
 
 #[test]
 fn block_with_no_entries_notifying_that_all_entries_are_submitted_passes_verification() {
@@ -274,4 +271,182 @@ fn shutdown_stops_scheduler_with_block_in_progress() {
         session.notify_all_entries_submitted(),
         Err(SchedulerShutdownError)
     );
+}
+
+#[test]
+fn block_with_valid_entries_passes_verification() {
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let stage = run_scheduler(TEST_SCHEDULER_CONFIG, shutdown_flag.clone());
+
+    // More entries than jobs can be in flight, so replay messages are received in several rounds
+    let session: BlockVerificationSession<Started> = stage
+        .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+    submit_entries(
+        &session,
+        entry_views_for_chain(PARENT_BANK_LAST_ENTRY_HASH, 100, 3),
+    );
+    let _session: BlockVerificationSession<AllEntriesSubmitted> =
+        session.notify_all_entries_submitted().unwrap();
+
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: BlockVerificationOutcome::Verified,
+        }
+    );
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
+}
+
+#[test]
+fn block_not_following_parent_bank_last_entry_hash_fails_verification() {
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let stage = run_scheduler(TEST_SCHEDULER_CONFIG, shutdown_flag.clone());
+
+    let session: BlockVerificationSession<Started> =
+        stage.begin_block(BANK_ID, SLOT, BOGUS_HASH).unwrap();
+
+    assert_ne!(
+        BOGUS_HASH, PARENT_BANK_LAST_ENTRY_HASH,
+        "sanity check for test failed. these hashes must not be the same for this test scenario"
+    );
+
+    submit_entries(
+        &session,
+        entry_views_for_chain(PARENT_BANK_LAST_ENTRY_HASH, 10, 3),
+    );
+    let _session: BlockVerificationSession<AllEntriesSubmitted> =
+        session.notify_all_entries_submitted().unwrap();
+
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: BlockVerificationOutcome::VerificationFailed,
+        }
+    );
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
+}
+
+#[test]
+fn block_with_invalid_entry_fails_verification_before_all_entries_are_submitted() {
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let stage = run_scheduler(TEST_SCHEDULER_CONFIG, shutdown_flag.clone());
+
+    const SECOND_BANK_ID: BankId = BANK_ID + 1;
+    const SECOND_SLOT: Slot = SLOT + 1;
+
+    let mut entry_views = entry_views_for_chain(PARENT_BANK_LAST_ENTRY_HASH, 10, 3);
+    entry_views[5].hash = BOGUS_HASH;
+    let entry_views_after_failure = entry_views.split_off(8);
+
+    let session: BlockVerificationSession<Started> = stage
+        .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+    submit_entries(&session, entry_views);
+
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: BlockVerificationOutcome::VerificationFailed,
+        }
+    );
+
+    // Entries submitted after the block failed verification are ignored, as is the
+    // notification that all its entries are submitted.
+    submit_entries(&session, entry_views_after_failure);
+    let _session: BlockVerificationSession<AllEntriesSubmitted> =
+        session.notify_all_entries_submitted().unwrap();
+
+    // Outcomes are sent in order, so a following block's outcome being next shows no other
+    // message was sent for the failed block.
+    let second_session: BlockVerificationSession<Started> = stage
+        .begin_block(SECOND_BANK_ID, SECOND_SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+    let _second_session: BlockVerificationSession<AllEntriesSubmitted> =
+        second_session.notify_all_entries_submitted().unwrap();
+
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SECOND_SLOT,
+            bank_id: SECOND_BANK_ID,
+            verification_status: BlockVerificationOutcome::Verified,
+        }
+    );
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
+}
+
+// TODO: This test is prone to race conditions. One potential fix is that the scheduler injects
+// the channels instead of the scheduler constructing the worker and creating channel handlers.
+// That way we can drive the actual completions of it. Maybe using a mock here would let us also control
+// the flow and expect what's happening.
+//
+//
+// The responses of jobs still in flight for an aborted block must not be counted towards a later
+// block reusing its bank id. With a single worker, the jobs of the aborted block run before the
+// job of the later block, so their responses arrive while the later block is in progress.
+#[test]
+fn aborting_block_with_entries_in_flight_ignores_their_verification() {
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let stage = run_scheduler(
+        SchedulerConfig {
+            num_entry_hash_workers: NonZeroUsize::new(1).unwrap(),
+            ..TEST_SCHEDULER_CONFIG
+        },
+        shutdown_flag.clone(),
+    );
+
+    let session: BlockVerificationSession<Started> = stage
+        .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+
+    submit_entries(
+        &session,
+        entry_views_for_chain(PARENT_BANK_LAST_ENTRY_HASH, 32, 1000),
+    );
+    let _session: BlockVerificationSession<Aborted> = session.abort_block_verification().unwrap();
+
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: BlockVerificationOutcome::Aborted,
+        }
+    );
+
+    // The only entry of the later block fails verification, which a successful response of the
+    // aborted block would otherwise hide by completing the later block first.
+    let session: BlockVerificationSession<Started> =
+        stage.begin_block(BANK_ID, SLOT, BOGUS_HASH).unwrap();
+    submit_entries(
+        &session,
+        entry_views_for_chain(PARENT_BANK_LAST_ENTRY_HASH, 1, 3),
+    );
+    let _session: BlockVerificationSession<AllEntriesSubmitted> =
+        session.notify_all_entries_submitted().unwrap();
+
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: BlockVerificationOutcome::VerificationFailed,
+        }
+    );
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
 }

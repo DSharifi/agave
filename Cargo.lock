@@ -1364,9 +1364,14 @@ version = "4.4.0-alpha.5"
 dependencies = [
  "bytes",
  "crossbeam-channel",
+ "log",
+ "shaq",
  "solana-clock",
  "solana-entry",
  "solana-hash",
+ "solana-keypair",
+ "solana-signer",
+ "solana-system-transaction",
  "test-case",
  "thiserror 2.0.20",
 ]

@@ -10,12 +10,13 @@
 //!   ┌─────────────┐  submit_entry(entry)
 //!   │   Started   │◄─────────┐
 //!   │             │──────────┘
-//!   └─────────────┘
-//!     │    │
-//!     │    │ notify_all_entries_submitted()
-//!     │    ▼
-//!     │  ┌─────────────────────┐
-//!     │  │ AllEntriesSubmitted │── Verified | VerificationFailed ──►┐
+//!   │             │── VerificationFailed ──────────────────────────►┐
+//!   └─────────────┘                                                 │
+//!     │    │                                                        │
+//!     │    │ notify_all_entries_submitted()                         │
+//!     │    ▼                                                        │
+//!     │  ┌─────────────────────┐                                    │
+//!     │  │ AllEntriesSubmitted │── Verified | VerificationFailed ──►┤
 //!     │  └─────────────────────┘                                    │
 //!     │    │                                                        │
 //!     ├────┘ abort_block_verification()                             │
@@ -29,8 +30,10 @@
 //!
 //!   Outcome, sent once per block on BlockVerificationStage::scheduler_message_receiver()
 //!   as BlockVerificationToReplayMessage { slot, bank_id, verification_status }:
-//!     Verified | VerificationFailed  ──► all entries submitted and verification finished
-//!     Aborted                        ──► aborted before verification finished
+//!     Verified            ──► all entries submitted and verified
+//!     VerificationFailed  ──► an entry failed verification, possibly before all entries were
+//!                             submitted. Entries submitted afterwards are ignored
+//!     Aborted             ──► aborted before verification finished
 //!   An abort arriving after the outcome was sent is ignored.
 //!
 //!   Every transition fails with an error if the scheduler has shut down.
@@ -39,6 +42,7 @@
 
 use {
     crate::{
+        join_thread,
         messages::{
             AbortMessage, AllEntriesSubmittedMessage, BeginMessage,
             BlockVerificationToReplayMessage, EntryMessage, ReplayToBlockVerificationMessage,
@@ -50,7 +54,7 @@ use {
     solana_clock::{BankId, Slot},
     solana_entry::entry::EntryView,
     solana_hash::Hash,
-    std::{marker::PhantomData, panic::resume_unwind, thread::JoinHandle},
+    std::{marker::PhantomData, thread::JoinHandle},
 };
 
 /// A type-state used over [`BlockVerificationSession<Started>`] representing the state
@@ -124,11 +128,7 @@ impl BlockVerificationStage {
 
     /// Waits for the scheduler thread to exit
     pub fn join(self) -> Result<(), SchedulerExitReason> {
-        match self.scheduler_thread_join_handle.join() {
-            Ok(exit_reason) => exit_reason,
-            // propagate panic
-            Err(error) => resume_unwind(error),
-        }
+        join_thread(self.scheduler_thread_join_handle)
     }
 
     /// Starts verifying the block for `bank_id` at `slot`, returning a session to submit its
@@ -222,6 +222,15 @@ impl BlockVerificationSession<Started> {
         Ok(session)
     }
 
+    /// Submits the next entry of the block.
+    ///
+    /// Entries must be submitted in block order, as each is verified against the hash of the
+    /// entry submitted before it, or the parent bank's last entry hash for the first one. Once
+    /// the block failed verification, its entries are ignored.
+    ///
+    /// ### NB!
+    /// Verifying an entry hashes `num_hashes` times, which the stage does not bound. The tick
+    /// hash counts of the entries must be checked before they are submitted.
     pub fn submit_entry(&self, entry_view: EntryView<Bytes>) -> Result<(), SchedulerShutdownError> {
         self.send(ReplayToBlockVerificationMessage::Entry(EntryMessage {
             bank_id: self.bank_id,
