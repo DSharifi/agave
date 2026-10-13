@@ -57,10 +57,13 @@ pub(super) struct BlockVerificationScheduler {
 
     verification_session_id_generator: VerificationSessionIdGenerator,
     blocks_in_progress: Vec<BlockVerificationState>,
-    buffered_replay_response_messages: VecDeque<BlockVerificationToReplayMessage>,
 
     // worker handles
     entry_hash_verification_workers: EntryHashVerificationWorkers,
+
+    // buffered work
+    buffered_entry_hash_verification_requests: VecDeque<EntryHashVerificationRequest>,
+    buffered_replay_response_messages: VecDeque<BlockVerificationToReplayMessage>,
 }
 
 impl BlockVerificationScheduler {
@@ -130,6 +133,7 @@ impl BlockVerificationScheduler {
             verification_session_id_generator: VerificationSessionIdGenerator::new(),
             blocks_in_progress: Vec::new(),
             buffered_replay_response_messages: VecDeque::new(),
+            buffered_entry_hash_verification_requests: VecDeque::new(),
             entry_hash_verification_workers,
         }
     }
@@ -141,6 +145,7 @@ impl BlockVerificationScheduler {
     fn run_scheduler_event_loop(mut self) -> Result<(), SchedulerExitReason> {
         while !self.shutdown_signal.load(Ordering::Relaxed) {
             self.try_flush_buffered_replay_responses()?;
+            self.try_flush_buffered_entry_verification_requests();
 
             // Responses come first, as handling them completes blocks and frees up job slots.
             select_biased! {
@@ -179,6 +184,28 @@ impl BlockVerificationScheduler {
         }
 
         Ok(())
+    }
+
+    /// Sends buffered entry verification requests without blocking, stopping at the first
+    /// failed send. Any remaining responses stay buffered until the next flush.
+    fn try_flush_buffered_entry_verification_requests(&mut self) {
+        while let Some(verification_request) =
+            self.buffered_entry_hash_verification_requests.pop_front()
+        {
+            match self
+                .entry_hash_verification_request_producer
+                .try_write(verification_request)
+            {
+                Ok(()) => {}
+                // backpressure
+                Err(request) => {
+                    self.buffered_entry_hash_verification_requests
+                        .push_back(request);
+
+                    break;
+                }
+            };
+        }
     }
 
     fn handle_replay_message(
@@ -257,10 +284,10 @@ impl BlockVerificationScheduler {
         );
         let progress_tracker = &mut block_verification_state.progress_tracker;
 
-        progress_tracker.entry_hash_jobs_in_flight = progress_tracker
-            .entry_hash_jobs_in_flight
+        progress_tracker.entry_hash_jobs_pending = progress_tracker
+            .entry_hash_jobs_pending
             .checked_add(1)
-            .expect("entry hash jobs in flight fits in u64");
+            .expect("entry hash job count fits in u64");
 
         let request = EntryHashVerificationRequest {
             block_verification_id: block_verification_state.block_verification_id,
@@ -268,10 +295,16 @@ impl BlockVerificationScheduler {
             entry_view,
         };
 
-        let () = self
+        match self
             .entry_hash_verification_request_producer
             .try_write(request)
-            .expect("verification workers can keep up");
+        {
+            Ok(()) => {}
+            // backpressure
+            Err(request) => self
+                .buffered_entry_hash_verification_requests
+                .push_back(request),
+        };
     }
 
     fn handle_abort_message(
@@ -328,10 +361,11 @@ impl BlockVerificationScheduler {
         }
 
         let progress_tracker = &mut block_verification_state.progress_tracker;
-        progress_tracker.entry_hash_jobs_in_flight = progress_tracker
-            .entry_hash_jobs_in_flight
+
+        progress_tracker.entry_hash_jobs_pending = progress_tracker
+            .entry_hash_jobs_pending
             .checked_sub(1)
-            .expect("entry hash verification response without a job in flight for the block");
+            .expect("entry hash verification response without a job pending for the block");
 
         self.try_complete_block(block_verification_state)
     }
@@ -421,12 +455,12 @@ struct DisconnectedResponseChannel;
 #[derive(Default)]
 struct BlockVerificationStatus {
     all_entries_are_submitted: bool,
-    entry_hash_jobs_in_flight: usize,
+    entry_hash_jobs_pending: usize,
 }
 
 impl BlockVerificationStatus {
     fn is_completed(&self) -> bool {
-        self.all_entries_are_submitted && self.entry_hash_jobs_in_flight == 0
+        self.all_entries_are_submitted && self.entry_hash_jobs_pending == 0
     }
 }
 

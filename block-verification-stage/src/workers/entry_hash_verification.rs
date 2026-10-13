@@ -7,6 +7,7 @@ use {
     shaq::{error::WaitError, mpmc},
     solana_entry::entry::EntryVerificationData,
     std::{
+        convert::Infallible,
         num::NonZeroUsize,
         sync::{
             Arc,
