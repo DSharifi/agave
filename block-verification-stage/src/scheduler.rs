@@ -11,7 +11,7 @@ use {
         utils::ShutdownOnDrop,
         workers::entry_hash_verification::EntryHashVerificationWorkers,
     },
-    crossbeam_channel::{Receiver, RecvError, Sender, TrySendError, bounded, select_biased},
+    crossbeam_channel::{Receiver, RecvError, Sender, TrySendError, bounded, never, select_biased},
     shaq::mpmc,
     solana_clock::{BankId, Slot},
     solana_hash::Hash,
@@ -58,11 +58,14 @@ pub(super) struct BlockVerificationScheduler {
     verification_session_id_generator: VerificationSessionIdGenerator,
     blocks_in_progress: Vec<BlockVerificationState>,
 
+    /// A request rejected by the full request queue. Replay messages are not received while a
+    /// request is held, so at most one is held.
+    held_entry_hash_verification_request: Option<EntryHashVerificationRequest>,
+
     // worker handles
     entry_hash_verification_workers: EntryHashVerificationWorkers,
 
     // buffered work
-    buffered_entry_hash_verification_requests: VecDeque<EntryHashVerificationRequest>,
     buffered_replay_response_messages: VecDeque<BlockVerificationToReplayMessage>,
 }
 
@@ -73,10 +76,10 @@ impl BlockVerificationScheduler {
     ) -> BlockVerificationStage {
         // entry - scheduler
         let (entry_hash_verification_request_producer, entry_hash_verification_request_consumer) =
-            mpmc::pair(scheduler_config.max_entry_hash_jobs_in_flight)
-                .expect("failed to allocate the entry hash verification request queue");
+            mpmc::pair(scheduler_config.entry_hash_verification_queue_size.get())
+                .expect("mpmc shaq channel can be allocated with the config");
         let (entry_hash_verification_response_sender, entry_hash_verification_response_receiver) =
-            bounded(scheduler_config.max_entry_hash_jobs_in_flight);
+            bounded(scheduler_config.entry_hash_verification_queue_size.get());
 
         // replay - scheduler
         let replay_to_block_verification =
@@ -132,8 +135,8 @@ impl BlockVerificationScheduler {
             workers_shutdown_signal: ShutdownOnDrop::from(workers_shutdown_signal),
             verification_session_id_generator: VerificationSessionIdGenerator::new(),
             blocks_in_progress: Vec::new(),
+            held_entry_hash_verification_request: None,
             buffered_replay_response_messages: VecDeque::new(),
-            buffered_entry_hash_verification_requests: VecDeque::new(),
             entry_hash_verification_workers,
         }
     }
@@ -145,7 +148,16 @@ impl BlockVerificationScheduler {
     fn run_scheduler_event_loop(mut self) -> Result<(), SchedulerExitReason> {
         while !self.shutdown_signal.load(Ordering::Relaxed) {
             self.try_flush_buffered_replay_responses()?;
-            self.try_flush_buffered_entry_verification_requests();
+            self.try_write_held_entry_hash_verification_request();
+
+            let replay_message_receiver = if self.can_receive_replay_message() {
+                &self.replay_message_receiver
+            }
+            // back-pressure; replay blocks on its bounded channel until the held request is
+            // written
+            else {
+                &never()
+            };
 
             // Responses come first, as handling them completes blocks and frees up job slots.
             select_biased! {
@@ -153,18 +165,57 @@ impl BlockVerificationScheduler {
                     let response = response.map_err(|_: RecvError| SchedulerExitReason::EntryHashVerificationWorkersExited)?;
                     let () = self.handle_entry_hash_verification_response(response)?;
                 }
-                recv(self.replay_message_receiver) -> replay_message => {
-                    let replay_message = replay_message.map_err(|_: RecvError| SchedulerExitReason::DisconnectedResponseChannel)?;
+                recv(replay_message_receiver) -> replay_message => {
+                    let replay_message = replay_message.map_err(|_: RecvError| SchedulerExitReason::DisconnectedRequestChannel)?;
                     let () = self.handle_replay_message(replay_message)?;
                 }
                 default(SHUTDOWN_POLL_INTERVAL) => {},
             }
         }
 
-        self.workers_shutdown_signal.shutdown();
-        let () = self.entry_hash_verification_workers.join_workers();
+        let Self {
+            mut workers_shutdown_signal,
+            entry_hash_verification_response_receiver,
+            entry_hash_verification_workers,
+            ..
+        } = self;
+
+        workers_shutdown_signal.shutdown();
+        // Workers blocked on sending a response to the full response channel exit once it
+        // disconnects.
+        drop(entry_hash_verification_response_receiver);
+        let () = entry_hash_verification_workers.join_workers();
 
         Ok(())
+    }
+
+    /// Replay messages are only received while no request is held, as an entry message may
+    /// produce a request the full request queue rejects.
+    fn can_receive_replay_message(&self) -> bool {
+        self.held_entry_hash_verification_request.is_none()
+    }
+
+    /// Writes the held request to the request queue if a worker has taken a request since it was
+    /// rejected. A request of a block that was aborted or failed in the meantime is dropped.
+    fn try_write_held_entry_hash_verification_request(&mut self) {
+        let Some(request) = self.held_entry_hash_verification_request.take() else {
+            return;
+        };
+
+        let block_is_in_progress = self
+            .blocks_in_progress
+            .iter()
+            .any(|state| state.block_verification_id == request.block_verification_id);
+        if !block_is_in_progress {
+            return;
+        }
+
+        if let Err(request) = self
+            .entry_hash_verification_request_producer
+            .try_write(request)
+        {
+            self.held_entry_hash_verification_request = Some(request);
+        }
     }
 
     /// Sends buffered replay responses without blocking, stopping at the first
@@ -184,33 +235,6 @@ impl BlockVerificationScheduler {
         }
 
         Ok(())
-    }
-
-    /// Sends buffered entry verification requests without blocking, stopping at the first
-    /// failed send. Any remaining responses stay buffered until the next flush.
-    fn try_flush_buffered_entry_verification_requests(&mut self) {
-        while let Some(verification_request) =
-            self.buffered_entry_hash_verification_requests.pop_front()
-        {
-            match self
-                .entry_hash_verification_request_producer
-                .try_write(verification_request)
-            {
-                Ok(()) => {}
-                // backpressure
-                Err(request) => {
-                    self.buffered_entry_hash_verification_requests
-                        .push_front(request);
-
-                    break;
-                }
-            };
-        }
-    }
-
-    fn remove_buffered_work_for_block(&mut self, block_verification_id: VerificationSessionId) {
-        self.buffered_entry_hash_verification_requests
-            .retain(|request| request.block_verification_id == block_verification_id);
     }
 
     fn handle_replay_message(
@@ -300,16 +324,16 @@ impl BlockVerificationScheduler {
             entry_view,
         };
 
-        match self
+        if let Err(request) = self
             .entry_hash_verification_request_producer
             .try_write(request)
         {
-            Ok(()) => {}
-            // backpressure
-            Err(request) => self
-                .buffered_entry_hash_verification_requests
-                .push_back(request),
-        };
+            assert!(
+                self.held_entry_hash_verification_request.is_none(),
+                "replay messages are not received while a request is held"
+            );
+            self.held_entry_hash_verification_request = Some(request);
+        }
     }
 
     fn handle_abort_message(
@@ -322,8 +346,6 @@ impl BlockVerificationScheduler {
             // The block completed or failed verification before the abort message arrived
             return Ok(());
         };
-
-        self.remove_buffered_work_for_block(block_verification_state.block_verification_id);
 
         self.send_outcome(block_verification_state, BlockVerificationOutcome::Aborted)
     }
@@ -361,7 +383,6 @@ impl BlockVerificationScheduler {
         };
 
         if !verified {
-            self.remove_buffered_work_for_block(block_verification_state.block_verification_id);
             return self.send_outcome(
                 block_verification_state,
                 BlockVerificationOutcome::VerificationFailed,
@@ -489,6 +510,7 @@ mod tests {
     const PARENT_BANK_LAST_ENTRY_HASH: Hash = Hash::new_from_array([2; _]);
     const BANK_ID: BankId = 123;
     const SLOT: Slot = 120;
+    const ENTRY_HASH_VERIFICATION_QUEUE_SIZE: usize = 64;
 
     struct ManuallyDrivenScheduler {
         scheduler: BlockVerificationScheduler,
@@ -501,7 +523,7 @@ mod tests {
             let (
                 entry_hash_verification_request_producer,
                 entry_hash_verification_request_consumer,
-            ) = mpmc::pair(64).unwrap();
+            ) = mpmc::pair(ENTRY_HASH_VERIFICATION_QUEUE_SIZE).unwrap();
             let (outcome_sender, outcome_receiver) = bounded(64);
 
             // The handlers are called directly, so nothing is ever received on these channels.
@@ -715,6 +737,98 @@ mod tests {
             scheduler.try_recv_outcome(),
             outcome(BANK_ID, SLOT, later_block_outcome),
             "a block's outcome must depend only on its own entries"
+        );
+    }
+
+    #[test]
+    fn entry_rejected_by_full_request_queue_is_held_until_a_worker_takes_a_request() {
+        let mut scheduler = ManuallyDrivenScheduler::new();
+
+        scheduler.begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH);
+        scheduler.submit_entries(
+            BANK_ID,
+            ticks_following(
+                PARENT_BANK_LAST_ENTRY_HASH,
+                ENTRY_HASH_VERIFICATION_QUEUE_SIZE + 1,
+            ),
+        );
+        scheduler.notify_all_entries_submitted(BANK_ID);
+        assert!(
+            !scheduler.scheduler.can_receive_replay_message(),
+            "replay messages must not be received while a request is held"
+        );
+
+        scheduler
+            .scheduler
+            .try_write_held_entry_hash_verification_request();
+        assert!(
+            !scheduler.scheduler.can_receive_replay_message(),
+            "the held request must stay held while the request queue is full"
+        );
+
+        for request in scheduler.take_entry_hash_verification_requests() {
+            scheduler.verify_entry_hash_and_respond(request);
+        }
+        assert_eq!(
+            scheduler.try_recv_outcome(),
+            None,
+            "a block must not complete while one of its requests is held"
+        );
+
+        scheduler
+            .scheduler
+            .try_write_held_entry_hash_verification_request();
+        assert!(
+            scheduler.scheduler.can_receive_replay_message(),
+            "the held request must be written once a worker took a request"
+        );
+
+        let [held_request] = scheduler
+            .take_entry_hash_verification_requests()
+            .try_into()
+            .unwrap();
+        scheduler.verify_entry_hash_and_respond(held_request);
+        assert_eq!(
+            scheduler.try_recv_outcome(),
+            outcome(BANK_ID, SLOT, BlockVerificationOutcome::Verified)
+        );
+    }
+
+    #[test_case(true ; "aborted block")]
+    #[test_case(false ; "failed block")]
+    fn held_request_of_finished_block_is_dropped(abort: bool) {
+        let mut scheduler = ManuallyDrivenScheduler::new();
+
+        let mut entries = ticks_following(
+            PARENT_BANK_LAST_ENTRY_HASH,
+            ENTRY_HASH_VERIFICATION_QUEUE_SIZE + 1,
+        );
+        if !abort {
+            entries[0].hash = BOGUS_HASH;
+        }
+
+        scheduler.begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH);
+        scheduler.submit_entries(BANK_ID, entries);
+        if abort {
+            scheduler.abort_block(BANK_ID);
+        }
+
+        let requests = scheduler.take_entry_hash_verification_requests();
+        if !abort {
+            let invalid_entry_request = requests.into_iter().next().unwrap();
+            scheduler.verify_entry_hash_and_respond(invalid_entry_request);
+        }
+
+        scheduler
+            .scheduler
+            .try_write_held_entry_hash_verification_request();
+        assert!(
+            scheduler.scheduler.can_receive_replay_message(),
+            "the held request of a block with an outcome must be dropped"
+        );
+        assert!(
+            scheduler.take_entry_hash_verification_requests().is_empty(),
+            "the held request of a block with an outcome must not be verified"
         );
     }
 }

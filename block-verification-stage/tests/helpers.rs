@@ -18,7 +18,7 @@ pub const TEST_SCHEDULER_CONFIG: SchedulerConfig = SchedulerConfig {
     replay_to_block_verification_channel_size: 10,
     block_verification_to_replay_channel_size: 10,
     num_entry_hash_workers: NonZeroUsize::new(2).unwrap(),
-    max_entry_hash_jobs_in_flight: 64,
+    entry_hash_verification_queue_size: NonZeroUsize::new(64).unwrap(),
 };
 pub const BOGUS_HASH: Hash = Hash::new_from_array([1; _]);
 pub const PARENT_BANK_LAST_ENTRY_HASH: Hash = Hash::new_from_array([2; _]);
