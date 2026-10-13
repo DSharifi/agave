@@ -7,7 +7,6 @@ use {
     shaq::{error::WaitError, mpmc},
     solana_entry::entry::EntryVerificationData,
     std::{
-        convert::Infallible,
         num::NonZeroUsize,
         sync::{
             Arc,
@@ -28,7 +27,7 @@ pub(crate) struct EntryHashVerificationWorkers {
 impl EntryHashVerificationWorkers {
     /// Spawns `num_workers` threads, which drop their response senders once they exit.
     pub(crate) fn spawn(
-        exit: Arc<AtomicBool>,
+        shutdown_signal: Arc<AtomicBool>,
         num_workers: NonZeroUsize,
         request_consumer: mpmc::Consumer<EntryHashVerificationRequest>,
         response_sender: Sender<EntryHashVerificationResponse>,
@@ -37,7 +36,7 @@ impl EntryHashVerificationWorkers {
             .map(|index| {
                 let request_consumer = request_consumer.clone();
                 let response_sender = response_sender.clone();
-                let exit = exit.clone();
+                let exit = shutdown_signal.clone();
                 thread::Builder::new()
                     .name(format!("solBlkVerHash{index}"))
                     .spawn(move || run_worker(&request_consumer, &response_sender, &exit))
@@ -66,9 +65,9 @@ impl EntryHashVerificationWorkers {
 fn run_worker(
     request_consumer: &mpmc::Consumer<EntryHashVerificationRequest>,
     response_sender: &Sender<EntryHashVerificationResponse>,
-    exit: &AtomicBool,
+    shutdown_signal: &AtomicBool,
 ) {
-    while !exit.load(Ordering::Relaxed) {
+    while !shutdown_signal.load(Ordering::Relaxed) {
         let verification_request = match request_consumer.read_timeout(EXIT_POLL_INTERVAL) {
             Ok(request) => request,
             Err(WaitError::Timeout) => continue,

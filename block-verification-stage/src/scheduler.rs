@@ -84,11 +84,11 @@ impl BlockVerificationScheduler {
         let block_verification_to_replay =
             bounded(scheduler_config.block_verification_to_replay_channel_size);
 
-        let worker_shutdown_signal = Arc::new(AtomicBool::new(false));
+        let workers_shutdown_signal = Arc::new(AtomicBool::new(false));
 
         let entry_hash_verification_workers: EntryHashVerificationWorkers =
             EntryHashVerificationWorkers::spawn(
-                worker_shutdown_signal.clone(),
+                workers_shutdown_signal.clone(),
                 scheduler_config.num_entry_hash_workers,
                 entry_hash_verification_request_consumer,
                 entry_hash_verification_response_sender,
@@ -100,7 +100,7 @@ impl BlockVerificationScheduler {
             entry_hash_verification_request_producer,
             entry_hash_verification_response_receiver,
             shutdown_signal,
-            worker_shutdown_signal,
+            workers_shutdown_signal,
             entry_hash_verification_workers,
         );
 
@@ -200,12 +200,17 @@ impl BlockVerificationScheduler {
                 // backpressure
                 Err(request) => {
                     self.buffered_entry_hash_verification_requests
-                        .push_back(request);
+                        .push_front(request);
 
                     break;
                 }
             };
         }
+    }
+
+    fn remove_buffered_work_for_block(&mut self, block_verification_id: VerificationSessionId) {
+        self.buffered_entry_hash_verification_requests
+            .retain(|request| request.block_verification_id == block_verification_id);
     }
 
     fn handle_replay_message(
@@ -318,6 +323,8 @@ impl BlockVerificationScheduler {
             return Ok(());
         };
 
+        self.remove_buffered_work_for_block(block_verification_state.block_verification_id);
+
         self.send_outcome(block_verification_state, BlockVerificationOutcome::Aborted)
     }
 
@@ -354,6 +361,7 @@ impl BlockVerificationScheduler {
         };
 
         if !verified {
+            self.remove_buffered_work_for_block(block_verification_state.block_verification_id);
             return self.send_outcome(
                 block_verification_state,
                 BlockVerificationOutcome::VerificationFailed,
