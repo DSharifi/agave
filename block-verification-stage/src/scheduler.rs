@@ -8,6 +8,7 @@ use {
             VerificationSessionId, VerificationSessionIdGenerator,
         },
         stage::BlockVerificationStage,
+        utils::ShutdownOnDrop,
         workers::entry_hash_verification::EntryHashVerificationWorkers,
     },
     crossbeam_channel::{Receiver, RecvError, Sender, TrySendError, bounded, select_biased},
@@ -52,6 +53,7 @@ pub(super) struct BlockVerificationScheduler {
     entry_hash_verification_response_receiver: Receiver<EntryHashVerificationResponse>,
 
     shutdown_signal: Arc<AtomicBool>,
+    workers_shutdown_signal: ShutdownOnDrop,
 
     verification_session_id_generator: VerificationSessionIdGenerator,
     blocks_in_progress: Vec<BlockVerificationState>,
@@ -79,9 +81,11 @@ impl BlockVerificationScheduler {
         let block_verification_to_replay =
             bounded(scheduler_config.block_verification_to_replay_channel_size);
 
+        let worker_shutdown_signal = Arc::new(AtomicBool::new(false));
+
         let entry_hash_verification_workers: EntryHashVerificationWorkers =
             EntryHashVerificationWorkers::spawn(
-                shutdown_signal.clone(),
+                worker_shutdown_signal.clone(),
                 scheduler_config.num_entry_hash_workers,
                 entry_hash_verification_request_consumer,
                 entry_hash_verification_response_sender,
@@ -93,6 +97,7 @@ impl BlockVerificationScheduler {
             entry_hash_verification_request_producer,
             entry_hash_verification_response_receiver,
             shutdown_signal,
+            worker_shutdown_signal,
             entry_hash_verification_workers,
         );
 
@@ -112,6 +117,7 @@ impl BlockVerificationScheduler {
         entry_hash_verification_request_producer: mpmc::Producer<EntryHashVerificationRequest>,
         entry_hash_verification_response_receiver: Receiver<EntryHashVerificationResponse>,
         shutdown_signal: Arc<AtomicBool>,
+        workers_shutdown_signal: Arc<AtomicBool>,
         entry_hash_verification_workers: EntryHashVerificationWorkers,
     ) -> Self {
         Self {
@@ -120,6 +126,7 @@ impl BlockVerificationScheduler {
             entry_hash_verification_request_producer,
             entry_hash_verification_response_receiver,
             shutdown_signal,
+            workers_shutdown_signal: ShutdownOnDrop::from(workers_shutdown_signal),
             verification_session_id_generator: VerificationSessionIdGenerator::new(),
             blocks_in_progress: Vec::new(),
             buffered_replay_response_messages: VecDeque::new(),
@@ -149,6 +156,7 @@ impl BlockVerificationScheduler {
             }
         }
 
+        self.workers_shutdown_signal.shutdown();
         let () = self.entry_hash_verification_workers.join_workers();
 
         Ok(())
@@ -463,6 +471,7 @@ mod tests {
                 outcome_sender,
                 entry_hash_verification_request_producer,
                 entry_hash_verification_response_receiver,
+                Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
                 EntryHashVerificationWorkers::none(),
             );

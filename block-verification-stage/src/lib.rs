@@ -7,6 +7,7 @@ pub use {config::SchedulerConfig, stage::BlockVerificationStage};
 
 mod config;
 mod scheduler;
+pub(crate) mod utils;
 mod workers;
 
 pub mod messages;
