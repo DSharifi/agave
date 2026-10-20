@@ -39,6 +39,7 @@
 
 use {
     crate::{
+        join_thread,
         messages::{
             AbortMessage, AllEntriesSubmittedMessage, BeginMessage,
             BlockVerificationToReplayMessage, EntryMessage, ReplayToBlockVerificationMessage,
@@ -50,7 +51,7 @@ use {
     solana_clock::{BankId, Slot},
     solana_entry::entry::EntryView,
     solana_hash::Hash,
-    std::{marker::PhantomData, panic::resume_unwind, thread::JoinHandle},
+    std::{marker::PhantomData, thread::JoinHandle},
 };
 
 /// A type-state used over [`BlockVerificationSession<Started>`] representing the state
@@ -124,11 +125,7 @@ impl BlockVerificationStage {
 
     /// Waits for the scheduler thread to exit
     pub fn join(self) -> Result<(), SchedulerExitReason> {
-        match self.scheduler_thread_join_handle.join() {
-            Ok(exit_reason) => exit_reason,
-            // propagate panic
-            Err(error) => resume_unwind(error),
-        }
+        join_thread(self.scheduler_thread_join_handle)
     }
 
     /// Starts verifying the block for `bank_id` at `slot`, returning a session to submit its
