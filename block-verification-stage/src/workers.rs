@@ -1,4 +1,5 @@
 pub(crate) mod entry_hash_verification;
+pub(crate) mod signature_verification;
 
 use {
     crate::join_thread,
