@@ -3,15 +3,21 @@ use {
         config::SchedulerConfig,
         messages::{
             AbortMessage, AllEntriesSubmittedMessage, BeginMessage, BlockVerificationOutcome,
-            BlockVerificationToReplayMessage, EntryMessage, ReplayToBlockVerificationMessage,
+            BlockVerificationToReplayMessage, EntryHashVerificationRequest,
+            EntryHashVerificationResponse, EntryMessage, ReplayToBlockVerificationMessage,
+            VerificationFailureReason,
         },
         stage::BlockVerificationStage,
+        utils::ShutdownOnDrop,
+        workers::{VerificationQueue, VerificationWorkers, entry_hash_verification},
     },
-    crossbeam_channel::{Receiver, RecvError, Sender, TrySendError, bounded, select},
+    crossbeam_channel::{Receiver, RecvError, Sender, TrySendError, bounded, never, select},
     solana_clock::{BankId, Slot},
+    solana_entry::entry::EntryVerificationData,
     solana_hash::Hash,
     std::{
         collections::VecDeque,
+        mem,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -29,6 +35,8 @@ pub enum SchedulerExitReason {
     DisconnectedResponseChannel,
     #[error("the block verification request sender was dropped")]
     DisconnectedRequestChannel,
+    #[error("every entry hash verification worker exited")]
+    EntryHashVerificationWorkersExited,
 }
 
 impl From<DisconnectedResponseChannel> for SchedulerExitReason {
@@ -41,9 +49,16 @@ pub(super) struct BlockVerificationScheduler {
     replay_message_receiver: Receiver<ReplayToBlockVerificationMessage>,
     replay_message_sender: Sender<BlockVerificationToReplayMessage>,
 
+    entry_hash_verification_queue:
+        VerificationQueue<EntryHashVerificationRequest, EntryHashVerificationResponse>,
+
     shutdown_signal: Arc<AtomicBool>,
+    workers_shutdown_signal: ShutdownOnDrop,
 
     blocks_in_progress: Vec<BlockVerificationState>,
+
+    entry_hash_verification_workers: VerificationWorkers,
+
     buffered_replay_response_messages: VecDeque<BlockVerificationToReplayMessage>,
 }
 
@@ -52,18 +67,38 @@ impl BlockVerificationScheduler {
         scheduler_config: SchedulerConfig,
         shutdown_signal: Arc<AtomicBool>,
     ) -> BlockVerificationStage {
+        let (
+            entry_hash_verification_queue,
+            entry_hash_verification_request_consumer,
+            entry_hash_verification_response_sender,
+        ) = VerificationQueue::new(scheduler_config.entry_hash_verification_queue_size);
+
         let replay_to_block_verification =
             bounded(scheduler_config.replay_to_block_verification_channel_size);
         let block_verification_to_replay =
             bounded(scheduler_config.block_verification_to_replay_channel_size);
 
-        let scheduler = Self {
-            replay_message_receiver: replay_to_block_verification.1,
-            replay_message_sender: block_verification_to_replay.0,
-            shutdown_signal: shutdown_signal.clone(),
-            blocks_in_progress: Vec::new(),
-            buffered_replay_response_messages: VecDeque::new(),
-        };
+        // Created before any worker is spawned, so if spawning a worker panics, the workers already
+        // spawned are shut down.
+        let workers_shutdown_signal = ShutdownOnDrop::from(Arc::new(AtomicBool::new(false)));
+
+        let entry_hash_verification_workers = VerificationWorkers::spawn(
+            entry_hash_verification::THREAD_NAME_PREFIX,
+            workers_shutdown_signal.signal().clone(),
+            scheduler_config.num_entry_hash_workers,
+            entry_hash_verification_request_consumer,
+            entry_hash_verification_response_sender,
+            entry_hash_verification::verify_entry_hash,
+        );
+
+        let scheduler = Self::new(
+            replay_to_block_verification.1,
+            block_verification_to_replay.0,
+            entry_hash_verification_queue,
+            shutdown_signal,
+            workers_shutdown_signal,
+            entry_hash_verification_workers,
+        );
 
         let scheduler_thread_join_handle =
             std::thread::spawn(move || scheduler.run_scheduler_event_loop());
@@ -75,7 +110,30 @@ impl BlockVerificationScheduler {
         )
     }
 
-    /// Runs until shutdown is requested or every replay message sender is dropped.
+    fn new(
+        replay_message_receiver: Receiver<ReplayToBlockVerificationMessage>,
+        replay_message_sender: Sender<BlockVerificationToReplayMessage>,
+        entry_hash_verification_queue: VerificationQueue<
+            EntryHashVerificationRequest,
+            EntryHashVerificationResponse,
+        >,
+        shutdown_signal: Arc<AtomicBool>,
+        workers_shutdown_signal: ShutdownOnDrop,
+        entry_hash_verification_workers: VerificationWorkers,
+    ) -> Self {
+        Self {
+            replay_message_receiver,
+            replay_message_sender,
+            entry_hash_verification_queue,
+            shutdown_signal,
+            workers_shutdown_signal,
+            blocks_in_progress: Vec::new(),
+            buffered_replay_response_messages: VecDeque::new(),
+            entry_hash_verification_workers,
+        }
+    }
+
+    /// Runs until shutdown is requested, or any of the channels to replay or the workers disconnect.
     ///
     /// Blocks still in progress are dropped on exit without an outcome being sent for them.
     /// Dropping the scheduler drops its outcome sender, disconnecting the stage's receiver.
@@ -83,16 +141,46 @@ impl BlockVerificationScheduler {
         while !self.shutdown_signal.load(Ordering::Relaxed) {
             self.try_flush_buffered_replay_responses()?;
 
+            let replay_message_receiver = if self.can_receive_replay_message() {
+                &self.replay_message_receiver
+            }
+            // back-pressure; replay's channel fills up until a worker responds to a request in
+            // flight
+            else {
+                &never()
+            };
+
             select! {
-                recv(self.replay_message_receiver) -> replay_message => {
-                    let replay_message = replay_message.map_err(|_: RecvError| SchedulerExitReason::DisconnectedResponseChannel)?;
+                recv(self.entry_hash_verification_queue.response_receiver()) -> response => {
+                    let response = response.map_err(|_: RecvError| SchedulerExitReason::EntryHashVerificationWorkersExited)?;
+                    let () = self.handle_entry_hash_verification_response(response)?;
+                }
+                recv(replay_message_receiver) -> replay_message => {
+                    let replay_message = replay_message.map_err(|_: RecvError| SchedulerExitReason::DisconnectedRequestChannel)?;
                     let () = self.handle_replay_message(replay_message)?;
                 }
                 default(SHUTDOWN_POLL_INTERVAL) => {},
             }
         }
 
+        let Self {
+            mut workers_shutdown_signal,
+            entry_hash_verification_queue,
+            entry_hash_verification_workers,
+            ..
+        } = self;
+
+        // The response channel has room for every request in flight, so workers never block on
+        // sending a response and will exit once they see the shutdown signal.
+        workers_shutdown_signal.shutdown();
+        drop(entry_hash_verification_queue);
+        let () = entry_hash_verification_workers.join_workers();
+
         Ok(())
+    }
+
+    fn can_receive_replay_message(&self) -> bool {
+        self.entry_hash_verification_queue.has_room_for_request()
     }
 
     /// Sends buffered replay responses without blocking, stopping at the first
@@ -163,7 +251,48 @@ impl BlockVerificationScheduler {
         ));
     }
 
-    fn handle_entry_message(&mut self, _entry_message: EntryMessage) {}
+    fn handle_entry_message(
+        &mut self,
+        EntryMessage {
+            bank_id,
+            entry_view,
+        }: EntryMessage,
+    ) {
+        let Some(block_verification_state) = self
+            .blocks_in_progress
+            .iter_mut()
+            .find(|state| state.bank_id == bank_id)
+        else {
+            // The block already has its outcome
+            return;
+        };
+
+        if block_verification_state.tracking_state != BlockTrackingState::InProgress {
+            return;
+        }
+
+        let entry_verification_data = EntryVerificationData::from(&entry_view);
+
+        // Every entry carries its own hash, which the next entry is verified against. So the
+        // entries of a block are verified independently of each other.
+        let start_hash = mem::replace(
+            &mut block_verification_state.last_entry_hash,
+            entry_verification_data.hash,
+        );
+        let progress_tracker = &mut block_verification_state.progress_tracker;
+
+        progress_tracker.entry_hash_jobs_pending = progress_tracker
+            .entry_hash_jobs_pending
+            .checked_add(1)
+            .expect("the jobs pending of a block are bounded by the request queue size");
+
+        self.entry_hash_verification_queue
+            .send(EntryHashVerificationRequest {
+                bank_id,
+                start_hash,
+                entry_verification_data,
+            });
+    }
 
     fn handle_abort_message(
         &mut self,
@@ -175,7 +304,10 @@ impl BlockVerificationScheduler {
             return Ok(());
         };
 
-        block_verification_state.tracking_state = BlockTrackingState::Aborted;
+        // A block that already failed verification keeps the failure as its outcome
+        if block_verification_state.tracking_state == BlockTrackingState::InProgress {
+            block_verification_state.tracking_state = BlockTrackingState::Aborted;
+        }
 
         self.try_release_block(block_verification_state)
     }
@@ -193,6 +325,31 @@ impl BlockVerificationScheduler {
         block_verification_state
             .progress_tracker
             .all_entries_are_submitted = true;
+
+        self.try_release_block(block_verification_state)
+    }
+
+    fn handle_entry_hash_verification_response(
+        &mut self,
+        EntryHashVerificationResponse { bank_id, verified }: EntryHashVerificationResponse,
+    ) -> Result<(), DisconnectedResponseChannel> {
+        self.entry_hash_verification_queue.complete_request();
+
+        let mut block_verification_state = self
+            .take_block_verification_state(&bank_id)
+            .expect("a block is only released once none of its requests are in flight");
+
+        let progress_tracker = &mut block_verification_state.progress_tracker;
+
+        progress_tracker.entry_hash_jobs_pending = progress_tracker
+            .entry_hash_jobs_pending
+            .checked_sub(1)
+            .expect("each response for a block answers a request counted as pending when sent");
+
+        if !verified && block_verification_state.tracking_state == BlockTrackingState::InProgress {
+            block_verification_state.tracking_state =
+                BlockTrackingState::Invalidated(VerificationFailureReason::InvalidEntryHash);
+        }
 
         self.try_release_block(block_verification_state)
     }
@@ -236,8 +393,7 @@ impl BlockVerificationScheduler {
 
 struct BlockVerificationState {
     bank_id: BankId,
-    #[expect(dead_code)]
-    parent_bank_last_entry_hash: Hash,
+    last_entry_hash: Hash,
     slot: Slot,
     tracking_state: BlockTrackingState,
     progress_tracker: BlockVerificationStatus,
@@ -247,7 +403,7 @@ impl BlockVerificationState {
     fn new(bank_id: BankId, parent_bank_last_entry_hash: Hash, slot: Slot) -> Self {
         Self {
             bank_id,
-            parent_bank_last_entry_hash,
+            last_entry_hash: parent_bank_last_entry_hash,
             slot,
             tracking_state: BlockTrackingState::InProgress,
             progress_tracker: BlockVerificationStatus::default(),
@@ -256,12 +412,19 @@ impl BlockVerificationState {
 
     /// The outcome of the block, once the block can be released.
     fn outcome(&self) -> Option<BlockVerificationOutcome> {
+        if self.progress_tracker.has_jobs_pending() {
+            return None;
+        }
+
         match self.tracking_state {
             BlockTrackingState::InProgress => self
                 .progress_tracker
-                .is_completed()
+                .all_entries_are_submitted
                 .then_some(BlockVerificationOutcome::Verified),
             BlockTrackingState::Aborted => Some(BlockVerificationOutcome::Aborted),
+            BlockTrackingState::Invalidated(failure_reason) => {
+                Some(BlockVerificationOutcome::VerificationFailed(failure_reason))
+            }
         }
     }
 }
@@ -270,6 +433,7 @@ impl BlockVerificationState {
 enum BlockTrackingState {
     InProgress,
     Aborted,
+    Invalidated(VerificationFailureReason),
 }
 
 struct DisconnectedResponseChannel;
@@ -277,10 +441,11 @@ struct DisconnectedResponseChannel;
 #[derive(Default)]
 struct BlockVerificationStatus {
     all_entries_are_submitted: bool,
+    entry_hash_jobs_pending: usize,
 }
 
 impl BlockVerificationStatus {
-    fn is_completed(&self) -> bool {
-        self.all_entries_are_submitted
+    fn has_jobs_pending(&self) -> bool {
+        self.entry_hash_jobs_pending > 0
     }
 }

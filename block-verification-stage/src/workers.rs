@@ -1,3 +1,5 @@
+pub(crate) mod entry_hash_verification;
+
 use {
     crate::join_thread,
     crossbeam_channel::{Receiver, Sender, bounded},
