@@ -436,6 +436,7 @@ enum BlockTrackingState {
     Invalidated(VerificationFailureReason),
 }
 
+#[derive(Debug)]
 struct DisconnectedResponseChannel;
 
 #[derive(Default)]
@@ -447,5 +448,340 @@ struct BlockVerificationStatus {
 impl BlockVerificationStatus {
     fn has_jobs_pending(&self) -> bool {
         self.entry_hash_jobs_pending > 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        bytes::Bytes,
+        crossbeam_channel::TryRecvError,
+        shaq::mpmc,
+        solana_entry::entry::{EntryView, entry_views_for_tests, next_entry_mut},
+        std::num::NonZeroUsize,
+        test_case::test_case,
+    };
+
+    const BOGUS_HASH: Hash = Hash::new_from_array([1; _]);
+    const PARENT_BANK_LAST_ENTRY_HASH: Hash = Hash::new_from_array([2; _]);
+    const BANK_ID: BankId = 123;
+    const SLOT: Slot = 120;
+    const ENTRY_HASH_VERIFICATION_QUEUE_SIZE: usize = 8;
+    const OUTCOME_CHANNEL_SIZE: usize = 64;
+
+    struct ManuallyDrivenScheduler {
+        scheduler: BlockVerificationScheduler,
+        entry_hash_verification_request_consumer: mpmc::Consumer<EntryHashVerificationRequest>,
+        outcome_receiver: Receiver<BlockVerificationToReplayMessage>,
+    }
+
+    impl ManuallyDrivenScheduler {
+        fn new() -> Self {
+            // The handlers are called directly, so nothing is ever received on the replay message
+            // channel, and the response sender is not needed.
+            let (entry_hash_verification_queue, entry_hash_verification_request_consumer, _) =
+                VerificationQueue::new(
+                    NonZeroUsize::new(ENTRY_HASH_VERIFICATION_QUEUE_SIZE).unwrap(),
+                );
+            let (outcome_sender, outcome_receiver) = bounded(OUTCOME_CHANNEL_SIZE);
+            let message_receiver = never();
+
+            let scheduler = BlockVerificationScheduler::new(
+                message_receiver,
+                outcome_sender,
+                entry_hash_verification_queue,
+                Arc::new(AtomicBool::new(false)),
+                ShutdownOnDrop::from(Arc::new(AtomicBool::new(false))),
+                VerificationWorkers::none(),
+            );
+
+            Self {
+                scheduler,
+                entry_hash_verification_request_consumer,
+                outcome_receiver,
+            }
+        }
+
+        fn begin_block(&mut self, bank_id: BankId, slot: Slot, parent_bank_last_entry_hash: Hash) {
+            self.handle_message(ReplayToBlockVerificationMessage::Begin(BeginMessage {
+                bank_id,
+                parent_bank_last_entry_hash,
+                slot,
+            }));
+        }
+
+        fn submit_entries(&mut self, bank_id: BankId, entry_views: Vec<EntryView<Bytes>>) {
+            for entry_view in entry_views {
+                self.handle_message(ReplayToBlockVerificationMessage::Entry(EntryMessage {
+                    bank_id,
+                    entry_view,
+                }));
+            }
+        }
+
+        fn notify_all_entries_submitted(&mut self, bank_id: BankId) {
+            self.handle_message(ReplayToBlockVerificationMessage::AllEntriesSubmitted(
+                AllEntriesSubmittedMessage { bank_id },
+            ));
+        }
+
+        fn abort_block(&mut self, bank_id: BankId) {
+            self.handle_message(ReplayToBlockVerificationMessage::Abort(AbortMessage {
+                bank_id,
+            }));
+        }
+
+        fn handle_message(&mut self, message: ReplayToBlockVerificationMessage) {
+            assert!(
+                self.scheduler.can_receive_replay_message(),
+                "the event loop does not receive replay messages while the request queue is full"
+            );
+            self.scheduler.handle_replay_message(message).unwrap();
+        }
+
+        fn take_entry_hash_verification_requests(&mut self) -> Vec<EntryHashVerificationRequest> {
+            std::iter::from_fn(|| self.entry_hash_verification_request_consumer.try_read())
+                .collect()
+        }
+
+        fn verify_entry_hash_and_respond(&mut self, request: EntryHashVerificationRequest) {
+            self.scheduler
+                .handle_entry_hash_verification_response(
+                    entry_hash_verification::verify_entry_hash(request),
+                )
+                .unwrap();
+        }
+
+        fn try_recv_outcome(&self) -> Option<BlockVerificationToReplayMessage> {
+            match self.outcome_receiver.try_recv() {
+                Ok(outcome) => Some(outcome),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => {
+                    panic!("the outcome sender is owned by the scheduler")
+                }
+            }
+        }
+
+        fn requests_in_flight(&self) -> usize {
+            self.scheduler
+                .entry_hash_verification_queue
+                .requests_in_flight()
+        }
+    }
+
+    fn ticks_following(start_hash: Hash, num_ticks: usize) -> Vec<EntryView<Bytes>> {
+        let mut hash = start_hash;
+        let ticks = (0..num_ticks)
+            .map(|_| next_entry_mut(&mut hash, 1, vec![]))
+            .collect();
+        entry_views_for_tests(ticks)
+    }
+
+    fn outcome(
+        bank_id: BankId,
+        slot: Slot,
+        verification_status: BlockVerificationOutcome,
+    ) -> Option<BlockVerificationToReplayMessage> {
+        Some(BlockVerificationToReplayMessage {
+            slot,
+            bank_id,
+            verification_status,
+        })
+    }
+
+    #[derive(Debug)]
+    enum LastStep {
+        AllEntriesSubmitted,
+        LastResponse,
+    }
+
+    #[test_case(LastStep::AllEntriesSubmitted; "all_entries_submitted_last")]
+    #[test_case(LastStep::LastResponse; "last_response_last")]
+    fn block_is_verified_once_all_entries_are_submitted_and_verified(last_step: LastStep) {
+        let mut scheduler = ManuallyDrivenScheduler::new();
+
+        scheduler.begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH);
+        scheduler.submit_entries(BANK_ID, ticks_following(PARENT_BANK_LAST_ENTRY_HASH, 3));
+        let [first_request, second_request, third_request] = scheduler
+            .take_entry_hash_verification_requests()
+            .try_into()
+            .unwrap();
+        scheduler.verify_entry_hash_and_respond(third_request);
+        scheduler.verify_entry_hash_and_respond(second_request);
+
+        match last_step {
+            LastStep::AllEntriesSubmitted => {
+                scheduler.verify_entry_hash_and_respond(first_request);
+                assert_eq!(
+                    scheduler.try_recv_outcome(),
+                    None,
+                    "a block must not complete before all its entries are submitted"
+                );
+                scheduler.notify_all_entries_submitted(BANK_ID);
+            }
+            LastStep::LastResponse => {
+                scheduler.notify_all_entries_submitted(BANK_ID);
+                assert_eq!(
+                    scheduler.try_recv_outcome(),
+                    None,
+                    "a block must not complete while verifications are in flight"
+                );
+                scheduler.verify_entry_hash_and_respond(first_request);
+            }
+        }
+        assert_eq!(
+            scheduler.try_recv_outcome(),
+            outcome(BANK_ID, SLOT, BlockVerificationOutcome::Verified)
+        );
+    }
+
+    #[derive(Debug)]
+    enum FinishBlock {
+        Abort,
+        FailVerification,
+    }
+
+    #[test_case(FinishBlock::Abort; "aborted")]
+    #[test_case(FinishBlock::FailVerification; "failed")]
+    fn finished_block_is_released_once_its_requests_in_flight_are_answered(
+        finish_block: FinishBlock,
+    ) {
+        let mut scheduler = ManuallyDrivenScheduler::new();
+
+        // Corrupting the hash of the second entry fails both its own verification and that of the
+        // third entry, which is verified against the corrupted hash. The first entry is valid.
+        let mut entries = ticks_following(PARENT_BANK_LAST_ENTRY_HASH, 4);
+        let entry_submitted_after_failure = entries.pop().unwrap();
+        entries[1].hash = BOGUS_HASH;
+
+        scheduler.begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH);
+        scheduler.submit_entries(BANK_ID, entries);
+        let mut requests_in_flight = scheduler.take_entry_hash_verification_requests();
+
+        let finished_block_outcome = match finish_block {
+            FinishBlock::Abort => {
+                scheduler.abort_block(BANK_ID);
+                BlockVerificationOutcome::Aborted
+            }
+            FinishBlock::FailVerification => {
+                let first_invalid_entry_request = requests_in_flight.remove(1);
+                scheduler.verify_entry_hash_and_respond(first_invalid_entry_request);
+
+                scheduler.submit_entries(BANK_ID, vec![entry_submitted_after_failure]);
+                assert!(
+                    scheduler.take_entry_hash_verification_requests().is_empty(),
+                    "the entries of a block that failed verification must not be verified"
+                );
+                BlockVerificationOutcome::VerificationFailed(
+                    VerificationFailureReason::InvalidEntryHash,
+                )
+            }
+        };
+
+        // The last request in flight is for an invalid entry, which must not change the outcome.
+        let last_request = requests_in_flight.pop().unwrap();
+        for request in requests_in_flight {
+            scheduler.verify_entry_hash_and_respond(request);
+        }
+        assert_eq!(
+            scheduler.try_recv_outcome(),
+            None,
+            "a block must not be released while requests for it are in flight"
+        );
+
+        scheduler.verify_entry_hash_and_respond(last_request);
+        assert_eq!(
+            scheduler.try_recv_outcome(),
+            outcome(BANK_ID, SLOT, finished_block_outcome),
+            "a block must be released once the last request for it is answered"
+        );
+        assert_eq!(scheduler.requests_in_flight(), 0);
+
+        scheduler.begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH);
+        scheduler.submit_entries(BANK_ID, ticks_following(PARENT_BANK_LAST_ENTRY_HASH, 1));
+        scheduler.notify_all_entries_submitted(BANK_ID);
+        for request in scheduler.take_entry_hash_verification_requests() {
+            scheduler.verify_entry_hash_and_respond(request);
+        }
+        assert_eq!(
+            scheduler.try_recv_outcome(),
+            outcome(BANK_ID, SLOT, BlockVerificationOutcome::Verified),
+            "a later block must be able to reuse the bank id and slot of a released block"
+        );
+    }
+
+    #[test]
+    fn aborting_block_that_failed_verification_keeps_the_failure_as_its_outcome() {
+        let mut scheduler = ManuallyDrivenScheduler::new();
+
+        // Both entries fail verification, the second against the corrupted hash of the first.
+        let mut entries = ticks_following(PARENT_BANK_LAST_ENTRY_HASH, 2);
+        entries[0].hash = BOGUS_HASH;
+
+        scheduler.begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH);
+        scheduler.submit_entries(BANK_ID, entries);
+        let [first_request, second_request] = scheduler
+            .take_entry_hash_verification_requests()
+            .try_into()
+            .unwrap();
+        scheduler.verify_entry_hash_and_respond(first_request);
+        scheduler.abort_block(BANK_ID);
+        assert_eq!(scheduler.try_recv_outcome(), None);
+
+        scheduler.verify_entry_hash_and_respond(second_request);
+        assert_eq!(
+            scheduler.try_recv_outcome(),
+            outcome(
+                BANK_ID,
+                SLOT,
+                BlockVerificationOutcome::VerificationFailed(
+                    VerificationFailureReason::InvalidEntryHash
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn replay_messages_are_not_received_while_requests_in_flight_fill_the_request_queue() {
+        let mut scheduler = ManuallyDrivenScheduler::new();
+
+        let mut entries = ticks_following(
+            PARENT_BANK_LAST_ENTRY_HASH,
+            ENTRY_HASH_VERIFICATION_QUEUE_SIZE + 1,
+        );
+        let last_entry = entries.pop().unwrap();
+
+        scheduler.begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH);
+        scheduler.submit_entries(BANK_ID, entries);
+        assert!(
+            !scheduler.scheduler.can_receive_replay_message(),
+            "replay messages must not be received while the request queue is full"
+        );
+
+        let mut requests = scheduler.take_entry_hash_verification_requests();
+        assert!(
+            !scheduler.scheduler.can_receive_replay_message(),
+            "a request taken by a worker must stay in flight until the worker responds"
+        );
+
+        scheduler.verify_entry_hash_and_respond(requests.pop().unwrap());
+        assert!(
+            scheduler.scheduler.can_receive_replay_message(),
+            "a response must free up room for a request"
+        );
+
+        scheduler.submit_entries(BANK_ID, vec![last_entry]);
+        for request in requests
+            .into_iter()
+            .chain(scheduler.take_entry_hash_verification_requests())
+        {
+            scheduler.verify_entry_hash_and_respond(request);
+        }
+        scheduler.notify_all_entries_submitted(BANK_ID);
+        assert_eq!(
+            scheduler.try_recv_outcome(),
+            outcome(BANK_ID, SLOT, BlockVerificationOutcome::Verified)
+        );
     }
 }
