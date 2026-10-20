@@ -1,4 +1,5 @@
 use {
+    agave_transaction_view::transaction_view::UnsanitizedTransactionView,
     bytes::Bytes,
     solana_clock::{BankId, Slot},
     solana_entry::entry::{EntryVerificationData, EntryView},
@@ -15,6 +16,7 @@ pub enum BlockVerificationOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationFailureReason {
     InvalidEntryHash,
+    InvalidSignature,
 }
 
 #[derive(Debug)]
@@ -65,6 +67,18 @@ pub(crate) struct EntryHashVerificationRequest {
 
 #[derive(Debug)]
 pub(crate) struct EntryHashVerificationResponse {
+    pub(crate) bank_id: BankId,
+    pub(crate) verified: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct SignatureVerificationRequest {
+    pub(crate) bank_id: BankId,
+    pub(crate) transactions: Vec<UnsanitizedTransactionView<Bytes>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SignatureVerificationResponse {
     pub(crate) bank_id: BankId,
     pub(crate) verified: bool,
 }

@@ -1394,6 +1394,7 @@ dependencies = [
 name = "block-verification-stage"
 version = "4.5.0-alpha.2"
 dependencies = [
+ "agave-transaction-view",
  "bytes",
  "crossbeam-channel",
  "shaq",
@@ -1401,8 +1402,10 @@ dependencies = [
  "solana-entry",
  "solana-hash",
  "solana-keypair",
+ "solana-signature",
  "solana-signer",
  "solana-system-transaction",
+ "solana-transaction",
  "test-case",
  "thiserror 2.0.21",
 ]
