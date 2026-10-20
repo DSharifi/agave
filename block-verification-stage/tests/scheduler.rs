@@ -1,6 +1,6 @@
 use {
+    crate::helpers::{BOGUS_HASH, RECV_TIMEOUT, SLOT, TEST_SCHEDULER_CONFIG},
     block_verification_stage::{
-        SchedulerConfig,
         messages::{BlockVerificationOutcome, BlockVerificationToReplayMessage},
         run_scheduler,
         stage::{
@@ -8,27 +8,19 @@ use {
         },
     },
     crossbeam_channel::RecvTimeoutError,
+    helpers::BANK_ID,
     solana_clock::{BankId, Slot},
-    solana_hash::Hash,
     std::{
         assert_matches,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
         },
-        time::Duration,
     },
     test_case::test_case,
 };
 
-const TEST_SCHEDULER_CONFIG: SchedulerConfig = SchedulerConfig {
-    replay_to_block_verification_channel_size: 10,
-    block_verification_to_replay_channel_size: 10,
-};
-const BOGUS_HASH: Hash = Hash::new_from_array([1; _]);
-const BANK_ID: BankId = 123;
-const SLOT: Slot = 120;
-const RECV_TIMEOUT: Duration = Duration::from_secs(5);
+pub mod helpers;
 
 #[test]
 fn block_with_no_entries_notifying_that_all_entries_are_submitted_passes_verification() {
