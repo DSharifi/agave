@@ -1504,6 +1504,7 @@ version = "5.0.0-alpha.0"
 dependencies = [
  "bytes",
  "crossbeam-channel",
+ "shaq",
  "solana-clock",
  "solana-entry",
  "solana-hash",
