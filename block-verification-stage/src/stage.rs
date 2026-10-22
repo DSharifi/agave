@@ -138,8 +138,8 @@ impl BlockVerificationStage {
     /// [`BlockVerificationStage::scheduler_message_receiver`].
     ///
     /// ### NB!
-    /// `bank_id` and `slot` must not be used by another in-progress block. Violating this
-    /// panics the scheduler thread and shuts it down.
+    /// `bank_id` and `slot` must not be used by another block before its outcome is received, even
+    /// once that block is aborted. Violating this panics the scheduler thread and shuts it down.
     pub fn begin_block(
         &self,
         bank_id: BankId,

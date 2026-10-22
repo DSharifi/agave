@@ -169,18 +169,15 @@ impl BlockVerificationScheduler {
         &mut self,
         AbortMessage { bank_id }: AbortMessage,
     ) -> Result<(), DisconnectedResponseChannel> {
-        let Some(block_verification_state) = self.take_block_verification_state(&bank_id) else {
+        let Some(mut block_verification_state) = self.take_block_verification_state(&bank_id)
+        else {
             // The block completed or failed verification before the abort message arrived
             return Ok(());
         };
 
-        self.buffered_replay_response_messages
-            .push_back(BlockVerificationToReplayMessage {
-                slot: block_verification_state.slot,
-                bank_id: block_verification_state.bank_id,
-                verification_status: BlockVerificationOutcome::Aborted,
-            });
-        self.try_flush_buffered_replay_responses()
+        block_verification_state.tracking_state = BlockTrackingState::Aborted;
+
+        self.try_release_block(block_verification_state)
     }
 
     fn handle_all_entries_submitted_message(
@@ -197,7 +194,7 @@ impl BlockVerificationScheduler {
             .progress_tracker
             .all_entries_are_submitted = true;
 
-        self.try_complete_block(block_verification_state)
+        self.try_release_block(block_verification_state)
     }
 
     /// Takes the state of the block being verified in `bank_id` out of the scheduler state.
@@ -216,23 +213,22 @@ impl BlockVerificationScheduler {
         )
     }
 
-    /// Sends a [`BlockVerificationOutcome::Verified`] message back to replay if every verification
-    /// operation of `block_verification_state` has finished, and returns the state to the
+    /// Sends the outcome of the block back to replay once it has one, and returns its state to the
     /// scheduler otherwise.
-    fn try_complete_block(
+    fn try_release_block(
         &mut self,
         block_verification_state: BlockVerificationState,
     ) -> Result<(), DisconnectedResponseChannel> {
-        if !block_verification_state.progress_tracker.is_completed() {
+        let Some(verification_status) = block_verification_state.outcome() else {
             self.blocks_in_progress.push(block_verification_state);
             return Ok(());
-        }
+        };
 
         self.buffered_replay_response_messages
             .push_back(BlockVerificationToReplayMessage {
                 slot: block_verification_state.slot,
                 bank_id: block_verification_state.bank_id,
-                verification_status: BlockVerificationOutcome::Verified,
+                verification_status,
             });
         self.try_flush_buffered_replay_responses()
     }
@@ -243,6 +239,7 @@ struct BlockVerificationState {
     #[expect(dead_code)]
     parent_bank_last_entry_hash: Hash,
     slot: Slot,
+    tracking_state: BlockTrackingState,
     progress_tracker: BlockVerificationStatus,
 }
 
@@ -252,9 +249,27 @@ impl BlockVerificationState {
             bank_id,
             parent_bank_last_entry_hash,
             slot,
+            tracking_state: BlockTrackingState::InProgress,
             progress_tracker: BlockVerificationStatus::default(),
         }
     }
+
+    /// The outcome of the block, once the block can be released.
+    fn outcome(&self) -> Option<BlockVerificationOutcome> {
+        match self.tracking_state {
+            BlockTrackingState::InProgress => self
+                .progress_tracker
+                .is_completed()
+                .then_some(BlockVerificationOutcome::Verified),
+            BlockTrackingState::Aborted => Some(BlockVerificationOutcome::Aborted),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockTrackingState {
+    InProgress,
+    Aborted,
 }
 
 struct DisconnectedResponseChannel;
