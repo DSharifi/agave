@@ -1,9 +1,12 @@
-use std::{
-    panic::resume_unwind,
-    sync::{Arc, atomic::AtomicBool},
-    thread::JoinHandle,
-};
 pub use {config::SchedulerConfig, stage::BlockVerificationStage};
+use {
+    solana_runtime::bank_forks::BankForks,
+    std::{
+        panic::resume_unwind,
+        sync::{Arc, RwLock, atomic::AtomicBool},
+        thread::JoinHandle,
+    },
+};
 
 mod config;
 mod scheduler;
@@ -16,8 +19,13 @@ pub mod stage;
 pub fn run_scheduler(
     scheduler_config: SchedulerConfig,
     shutdown_signal: Arc<AtomicBool>,
+    bank_forks: Arc<RwLock<BankForks>>,
 ) -> BlockVerificationStage {
-    scheduler::BlockVerificationScheduler::run_scheduler(scheduler_config, shutdown_signal)
+    scheduler::BlockVerificationScheduler::run_scheduler(
+        scheduler_config,
+        shutdown_signal,
+        bank_forks,
+    )
 }
 
 pub(crate) fn join_thread<T>(join_handle: JoinHandle<T>) -> T {
