@@ -1508,6 +1508,9 @@ dependencies = [
  "solana-clock",
  "solana-entry",
  "solana-hash",
+ "solana-keypair",
+ "solana-signer",
+ "solana-system-transaction",
  "test-case",
  "thiserror 2.0.21",
 ]
