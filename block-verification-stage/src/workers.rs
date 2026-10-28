@@ -1,4 +1,5 @@
 pub(crate) mod entry_hash_verification;
+pub(crate) mod signature_verification;
 
 use {
     crate::join_thread,
@@ -68,6 +69,16 @@ impl<Request: Send + Debug, Response> VerificationQueue<Request, Response> {
             .requests_in_flight
             .checked_add(1)
             .expect("requests in flight are bounded by the request queue size");
+    }
+
+    /// Sends the request if the pool has capacity for it
+    pub(crate) fn try_send(&mut self, request: Request) -> Result<(), Request> {
+        if !self.can_send_request() {
+            return Err(request);
+        }
+
+        self.send(request);
+        Ok(())
     }
 
     /// Records that the scheduler handled the response to a request in flight.

@@ -1,9 +1,10 @@
 use {
     crate::helpers::{
         BOGUS_HASH, PARENT_BANK_LAST_ENTRY_HASH, RECV_TIMEOUT, SLOT, TEST_SCHEDULER_CONFIG,
-        entry_views_for_chain, recv_outcome, submit_entries,
+        entry_views_for_chain, recv_outcome, sign, submit_entries, transfer,
     },
     block_verification_stage::{
+        SchedulerConfig,
         messages::{
             BlockVerificationOutcome, BlockVerificationToReplayMessage, VerificationFailureReason,
         },
@@ -15,8 +16,12 @@ use {
     crossbeam_channel::RecvTimeoutError,
     helpers::BANK_ID,
     solana_clock::{BankId, Slot},
+    solana_entry::entry::{entry_views_for_tests, next_entry_mut},
+    solana_keypair::Keypair,
+    solana_signer::Signer,
     std::{
         assert_matches,
+        num::NonZeroUsize,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -273,18 +278,20 @@ fn shutdown_stops_scheduler_with_block_in_progress() {
     );
 }
 
-#[test]
-fn block_with_valid_entries_passes_verification() {
+#[test_case(1; "one_signature")]
+#[test_case(2; "two_signatures")]
+fn block_with_valid_entries_passes_verification(num_signatures: u8) {
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let stage = run_scheduler(TEST_SCHEDULER_CONFIG, shutdown_flag.clone());
 
-    // More entries than jobs can be in flight, so entries are received in several rounds
+    // More entries than jobs can be in flight, so entries are received in several rounds. Every
+    // other entry has a transaction, whose signatures are verified.
     let session: BlockVerificationSession<Started> = stage
         .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
         .unwrap();
     submit_entries(
         &session,
-        entry_views_for_chain(PARENT_BANK_LAST_ENTRY_HASH, 100, 3),
+        entry_views_for_chain(PARENT_BANK_LAST_ENTRY_HASH, 100, 3, num_signatures),
     );
     let _session: BlockVerificationSession<AllEntriesSubmitted> =
         session.notify_all_entries_submitted().unwrap();
@@ -324,7 +331,7 @@ fn block_with_invalid_entry_fails_verification_before_all_entries_are_submitted(
     const NEXT_SLOT: Slot = SLOT + 1;
 
     let mut entries_submitted_with_failure =
-        entry_views_for_chain(PARENT_BANK_LAST_ENTRY_HASH, NUM_ENTRIES, 3);
+        entry_views_for_chain(PARENT_BANK_LAST_ENTRY_HASH, NUM_ENTRIES, 3, 1);
     let entries_submitted_after_failure =
         entries_submitted_with_failure.split_off(NUM_ENTRIES_SUBMITTED_BEFORE_FAILURE);
 
@@ -373,6 +380,124 @@ fn block_with_invalid_entry_fails_verification_before_all_entries_are_submitted(
         BlockVerificationToReplayMessage {
             slot: NEXT_SLOT,
             bank_id: NEXT_BANK_ID,
+            verification_status: BlockVerificationOutcome::Verified,
+        }
+    );
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
+}
+
+#[derive(Debug)]
+enum Tampering {
+    SignedByWrongKeypair,
+    SignedOverOtherMessage,
+    MissingSignature,
+    ExtraSignature,
+    MissingStaticAccountKey,
+}
+
+// A transaction's signatures are valid only when each of its required signers signed its message,
+// and it has exactly one signature for each of them.
+#[test_case(Tampering::SignedByWrongKeypair; "signed_by_wrong_keypair")]
+#[test_case(Tampering::SignedOverOtherMessage; "signed_over_other_message")]
+#[test_case(Tampering::MissingSignature; "missing_signature")]
+#[test_case(Tampering::ExtraSignature; "extra_signature")]
+#[test_case(Tampering::MissingStaticAccountKey; "missing_static_account_key")]
+fn block_with_invalid_signature_fails_verification(tampering: Tampering) {
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let stage = run_scheduler(TEST_SCHEDULER_CONFIG, shutdown_flag.clone());
+
+    let payer = Keypair::new();
+    let recipient = Keypair::new();
+    let other = Keypair::new();
+    let mut transaction = transfer(&payer, &recipient, 2);
+
+    // The tamperings of the number of signatures or keys keep every signature that can be paired
+    // with a static account key valid for that key. So the transaction fails verification only
+    // because the numbers are checked.
+    match tampering {
+        Tampering::SignedByWrongKeypair => sign(&mut transaction, &[&payer, &other]),
+        Tampering::SignedOverOtherMessage => {
+            transaction.signatures[1] = recipient.sign_message(b"other message");
+        }
+        Tampering::MissingSignature => sign(&mut transaction, &[&payer]),
+        Tampering::ExtraSignature => {
+            // The recipient signs, but only the payer is a required signer.
+            transaction.message.header.num_required_signatures = 1;
+            sign(&mut transaction, &[&payer, &recipient]);
+        }
+        Tampering::MissingStaticAccountKey => {
+            // Only the payer and the recipient remain as static account keys, but three signers
+            // are required.
+            transaction.message.instructions.clear();
+            transaction.message.account_keys.truncate(2);
+            transaction.message.header.num_readonly_unsigned_accounts = 0;
+            transaction.message.header.num_required_signatures = 3;
+            sign(&mut transaction, &[&payer, &recipient, &other]);
+        }
+    }
+
+    // The entry hashes are valid, as they are computed from the tampered signatures.
+    let mut hash = PARENT_BANK_LAST_ENTRY_HASH;
+    let entries = vec![
+        next_entry_mut(&mut hash, 3, vec![]),
+        next_entry_mut(&mut hash, 3, vec![transaction]),
+        next_entry_mut(&mut hash, 3, vec![]),
+    ];
+
+    let session: BlockVerificationSession<Started> = stage
+        .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+    submit_entries(&session, entry_views_for_tests(entries));
+    let _session: BlockVerificationSession<AllEntriesSubmitted> =
+        session.notify_all_entries_submitted().unwrap();
+
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: BlockVerificationOutcome::VerificationFailed(
+                VerificationFailureReason::InvalidSignature
+            ),
+        }
+    );
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
+}
+
+/// tests that buffered signature verifications get verified
+#[test]
+fn block_with_an_entry_larger_than_the_signature_request_queue_passes_verification() {
+    const NUM_TRANSACTIONS: usize = 100;
+    const MAX_SIGNATURE_VERIFICATIONS_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(1).unwrap();
+
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let config = SchedulerConfig {
+        max_signature_verifications_in_flight: MAX_SIGNATURE_VERIFICATIONS_IN_FLIGHT,
+        ..TEST_SCHEDULER_CONFIG
+    };
+    let stage = run_scheduler(config, shutdown_flag.clone());
+
+    let transactions = vec![transfer(&Keypair::new(), &Keypair::new(), 1); NUM_TRANSACTIONS];
+
+    let mut hash = PARENT_BANK_LAST_ENTRY_HASH;
+    let entries = vec![next_entry_mut(&mut hash, 3, transactions)];
+
+    let session: BlockVerificationSession<Started> = stage
+        .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+    submit_entries(&session, entry_views_for_tests(entries));
+    let _session: BlockVerificationSession<AllEntriesSubmitted> =
+        session.notify_all_entries_submitted().unwrap();
+
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
             verification_status: BlockVerificationOutcome::Verified,
         }
     );
