@@ -18,14 +18,17 @@ pub(crate) fn verify_signatures(
         static_account_keys.len() >= num_required_signatures;
 
     let message = transaction.message_data();
-    let every_signer_signed_the_message = signatures
-        .iter()
-        .zip(static_account_keys)
-        .all(|(signature, signer)| signature.verify(signer.as_ref(), message));
+    let every_signer_signed_the_message = || {
+        signatures
+            .iter()
+            .zip(static_account_keys)
+            .all(|(signature, signer)| signature.verify(signer.as_ref(), message))
+    };
 
+    // The signatures are only verified once their number is known to be right.
     let verified = has_a_signature_for_every_signer
         && every_signer_has_a_static_account_key
-        && every_signer_signed_the_message;
+        && every_signer_signed_the_message();
 
     SignatureVerificationResponse { bank_id, verified }
 }
