@@ -11,6 +11,7 @@ use {
     solana_keypair::Keypair,
     solana_signer::Signer,
     solana_system_transaction as system_transaction,
+    solana_transaction::Transaction,
     std::{num::NonZeroUsize, time::Duration},
 };
 
@@ -20,6 +21,8 @@ pub const TEST_SCHEDULER_CONFIG: SchedulerConfig = SchedulerConfig {
     block_verification_to_replay_channel_size: 10,
     num_entry_hash_workers: NonZeroUsize::new(2).unwrap(),
     max_entry_hash_verifications_in_flight: NonZeroUsize::new(64).unwrap(),
+    num_signature_workers: NonZeroUsize::new(2).unwrap(),
+    max_signature_verifications_in_flight: NonZeroUsize::new(16).unwrap(),
 };
 pub const BOGUS_HASH: Hash = Hash::new_from_array([1; _]);
 pub const PARENT_BANK_LAST_ENTRY_HASH: Hash = Hash::new_from_array([2; _]);
@@ -27,26 +30,47 @@ pub const BANK_ID: BankId = 123;
 pub const SLOT: Slot = 120;
 pub const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Replaces the signatures of `transaction` with those of `signers` over its message.
+pub fn sign(transaction: &mut Transaction, signers: &[&Keypair]) {
+    let message = transaction.message_data();
+    transaction.signatures = signers
+        .iter()
+        .map(|signer| signer.sign_message(&message))
+        .collect();
+}
+
+/// Returns a transfer from `payer` to `recipient`, signed by the payer, and by the recipient too
+/// with two signatures. Its static account keys are the payer, the recipient and the system
+/// program.
+pub fn transfer(payer: &Keypair, recipient: &Keypair, num_signatures: u8) -> Transaction {
+    let mut transaction =
+        system_transaction::transfer(payer, &recipient.pubkey(), 1, Hash::default());
+    transaction.message.header.num_required_signatures = num_signatures;
+    sign(
+        &mut transaction,
+        &[payer, recipient][..usize::from(num_signatures)],
+    );
+    transaction
+}
+
 /// Returns a chain of `num_entries` entries following `start_hash`, alternating between ticks and
-/// entries with a transaction, each `num_hashes` after the previous one.
+/// entries with a transfer with `num_signatures` signatures, each `num_hashes` after the previous
+/// one.
 pub fn entry_views_for_chain(
     start_hash: Hash,
     num_entries: usize,
     num_hashes: u64,
+    num_signatures: u8,
 ) -> Vec<EntryView<Bytes>> {
-    let keypair = Keypair::new();
+    let payer = Keypair::new();
+    let recipient = Keypair::new();
     let mut hash = start_hash;
     let entries = (0..num_entries)
         .map(|index| {
             let transactions = if index.is_multiple_of(2) {
                 vec![]
             } else {
-                vec![system_transaction::transfer(
-                    &keypair,
-                    &keypair.pubkey(),
-                    1,
-                    start_hash,
-                )]
+                vec![transfer(&payer, &recipient, num_signatures)]
             };
             next_entry_mut(&mut hash, num_hashes, transactions)
         })
