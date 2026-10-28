@@ -71,6 +71,16 @@ impl<Request: Send + Debug, Response> VerificationQueue<Request, Response> {
             .expect("requests in flight are bounded by the request queue size");
     }
 
+    /// Sends the request if the pool has capacity for it
+    pub(crate) fn try_send(&mut self, request: Request) -> Result<(), Request> {
+        if !self.can_send_request() {
+            return Err(request);
+        }
+
+        self.send(request);
+        Ok(())
+    }
+
     /// Records that the scheduler handled the response to a request in flight.
     ///
     /// Panics if called more times than [`Self::send`].

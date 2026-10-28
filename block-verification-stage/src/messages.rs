@@ -74,7 +74,7 @@ pub(crate) struct EntryHashVerificationResponse {
 #[derive(Debug)]
 pub(crate) struct SignatureVerificationRequest {
     pub(crate) bank_id: BankId,
-    pub(crate) transactions: Vec<UnsanitizedTransactionView<Bytes>>,
+    pub(crate) transaction: UnsanitizedTransactionView<Bytes>,
 }
 
 #[derive(Debug)]

@@ -4,6 +4,7 @@ use {
         entry_views_for_chain, recv_outcome, sign, submit_entries, transfer,
     },
     block_verification_stage::{
+        SchedulerConfig,
         messages::{
             BlockVerificationOutcome, BlockVerificationToReplayMessage, VerificationFailureReason,
         },
@@ -20,6 +21,7 @@ use {
     solana_signer::Signer,
     std::{
         assert_matches,
+        num::NonZeroUsize,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -459,6 +461,44 @@ fn block_with_invalid_signature_fails_verification(tampering: Tampering) {
             verification_status: BlockVerificationOutcome::VerificationFailed(
                 VerificationFailureReason::InvalidSignature
             ),
+        }
+    );
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
+}
+
+/// tests that buffered signature verifications get verified
+#[test]
+fn block_with_an_entry_larger_than_the_signature_request_queue_passes_verification() {
+    const NUM_TRANSACTIONS: usize = 100;
+    const MAX_SIGNATURE_VERIFICATIONS_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(1).unwrap();
+
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let config = SchedulerConfig {
+        max_signature_verifications_in_flight: MAX_SIGNATURE_VERIFICATIONS_IN_FLIGHT,
+        ..TEST_SCHEDULER_CONFIG
+    };
+    let stage = run_scheduler(config, shutdown_flag.clone());
+
+    let transactions = vec![transfer(&Keypair::new(), &Keypair::new(), 1); NUM_TRANSACTIONS];
+
+    let mut hash = PARENT_BANK_LAST_ENTRY_HASH;
+    let entries = vec![next_entry_mut(&mut hash, 3, transactions)];
+
+    let session: BlockVerificationSession<Started> = stage
+        .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+    submit_entries(&session, entry_views_for_tests(entries));
+    let _session: BlockVerificationSession<AllEntriesSubmitted> =
+        session.notify_all_entries_submitted().unwrap();
+
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: BlockVerificationOutcome::Verified,
         }
     );
 

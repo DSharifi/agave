@@ -70,6 +70,7 @@ pub(super) struct BlockVerificationScheduler {
     signature_verification_workers: VerificationWorkers,
 
     buffered_replay_response_messages: VecDeque<BlockVerificationToReplayMessage>,
+    buffered_signature_verification_requests: VecDeque<SignatureVerificationRequest>,
 }
 
 impl BlockVerificationScheduler {
@@ -154,6 +155,7 @@ impl BlockVerificationScheduler {
             workers_shutdown_signal,
             blocks_in_progress: Vec::new(),
             buffered_replay_response_messages: VecDeque::new(),
+            buffered_signature_verification_requests: VecDeque::new(),
             entry_hash_verification_workers,
             signature_verification_workers,
         }
@@ -166,6 +168,7 @@ impl BlockVerificationScheduler {
     fn run_scheduler_event_loop(mut self) -> Result<(), SchedulerExitReason> {
         while !self.shutdown_signal.load(Ordering::Relaxed) {
             self.try_flush_buffered_replay_responses()?;
+            self.try_flush_buffered_signature_verification_requests();
 
             let replay_message_receiver = if self.workers_can_accept_request() {
                 &self.replay_message_receiver
@@ -215,6 +218,17 @@ impl BlockVerificationScheduler {
     fn workers_can_accept_request(&self) -> bool {
         self.entry_hash_verification_queue.can_send_request()
             && self.signature_verification_queue.can_send_request()
+            && self.buffered_signature_verification_requests.is_empty()
+    }
+
+    fn try_flush_buffered_signature_verification_requests(&mut self) {
+        while let Some(request) = self.buffered_signature_verification_requests.pop_front() {
+            if let Err(request) = self.signature_verification_queue.try_send(request) {
+                self.buffered_signature_verification_requests
+                    .push_front(request);
+                break;
+            }
+        }
     }
 
     /// Sends buffered replay responses without blocking, stopping at the first
@@ -327,20 +341,34 @@ impl BlockVerificationScheduler {
                 entry_verification_data,
             });
 
-        if entry_view.is_tick() {
-            return;
-        }
-
         progress_tracker.signature_jobs_pending = progress_tracker
             .signature_jobs_pending
-            .checked_add(1)
-            .expect("the jobs pending of a block are bounded by the request queue size");
+            .checked_add(entry_view.transactions.len())
+            .expect(
+                "the jobs pending of a block are bounded by the request queue size and the \
+                 transactions of one entry",
+            );
 
-        self.signature_verification_queue
-            .send(SignatureVerificationRequest {
-                bank_id,
-                transactions: entry_view.transactions,
-            });
+        let mut requests =
+            entry_view
+                .transactions
+                .into_iter()
+                .map(|transaction| SignatureVerificationRequest {
+                    bank_id,
+                    transaction,
+                });
+
+        for request in requests.by_ref() {
+            let Err(request) = self.signature_verification_queue.try_send(request) else {
+                continue;
+            };
+
+            self.buffered_signature_verification_requests
+                .push_back(request);
+            break;
+        }
+        self.buffered_signature_verification_requests
+            .extend(requests);
     }
 
     fn handle_abort_message(
