@@ -1,4 +1,3 @@
-pub use {config::SchedulerConfig, stage::BlockVerificationStage};
 use {
     solana_runtime::bank_forks::BankForks,
     std::{
@@ -15,6 +14,8 @@ mod workers;
 
 pub mod messages;
 pub mod stage;
+
+pub use {config::SchedulerConfig, stage::BlockVerificationStage};
 
 pub fn run_scheduler(
     scheduler_config: SchedulerConfig,
