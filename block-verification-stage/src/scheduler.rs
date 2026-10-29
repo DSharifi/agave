@@ -79,6 +79,7 @@ pub(super) struct BlockVerificationScheduler {
 
     buffered_replay_response_messages: VecDeque<BlockVerificationToReplayMessage>,
     buffered_signature_verification_requests: VecDeque<SignatureVerificationRequest>,
+    buffered_transaction_check_requests: VecDeque<TransactionCheckRequest>,
 }
 
 impl BlockVerificationScheduler {
@@ -134,7 +135,7 @@ impl BlockVerificationScheduler {
             scheduler_config.num_transaction_check_workers,
             transaction_check_request_consumer,
             transaction_check_response_sender,
-            move |request| transaction_check::check_transactions(&bank_forks, request),
+            move |request| transaction_check::check_transaction(&bank_forks, request),
         );
 
         let scheduler = Self::new(
@@ -184,6 +185,7 @@ impl BlockVerificationScheduler {
             blocks_in_progress: Vec::new(),
             buffered_replay_response_messages: VecDeque::new(),
             buffered_signature_verification_requests: VecDeque::new(),
+            buffered_transaction_check_requests: VecDeque::new(),
             entry_hash_verification_workers,
             signature_verification_workers,
             transaction_check_workers,
@@ -198,6 +200,7 @@ impl BlockVerificationScheduler {
         while !self.shutdown_signal.load(Ordering::Relaxed) {
             self.try_flush_buffered_replay_responses()?;
             self.try_flush_buffered_signature_verification_requests();
+            self.try_flush_buffered_transaction_check_requests();
 
             let replay_message_receiver = if self.workers_can_accept_request() {
                 &self.replay_message_receiver
@@ -257,6 +260,7 @@ impl BlockVerificationScheduler {
             && self.signature_verification_queue.can_send_request()
             && self.transaction_check_queue.can_send_request()
             && self.buffered_signature_verification_requests.is_empty()
+            && self.buffered_transaction_check_requests.is_empty()
     }
 
     fn try_flush_buffered_signature_verification_requests(&mut self) {
@@ -264,6 +268,15 @@ impl BlockVerificationScheduler {
             if let Err(request) = self.signature_verification_queue.try_send(request) {
                 self.buffered_signature_verification_requests
                     .push_front(request);
+                break;
+            }
+        }
+    }
+
+    fn try_flush_buffered_transaction_check_requests(&mut self) {
+        while let Some(request) = self.buffered_transaction_check_requests.pop_front() {
+            if let Err(request) = self.transaction_check_queue.try_send(request) {
+                self.buffered_transaction_check_requests.push_front(request);
                 break;
             }
         }
@@ -406,20 +419,34 @@ impl BlockVerificationScheduler {
         self.buffered_signature_verification_requests
             .extend(requests);
 
-        if entry_view.is_tick() {
-            return;
-        }
-
         progress_tracker.transaction_check_jobs_pending = progress_tracker
             .transaction_check_jobs_pending
-            .checked_add(1)
-            .expect("the jobs pending of a block are bounded by the request queue size");
+            .checked_add(entry_view.transactions.len())
+            .expect(
+                "the jobs pending of a block are bounded by the request queue size and the \
+                 transactions of one entry",
+            );
 
-        self.transaction_check_queue.send(TransactionCheckRequest {
-            bank_id,
-            slot: block_verification_state.slot,
-            transactions: entry_view.transactions,
-        });
+        let slot = block_verification_state.slot;
+        let mut requests =
+            entry_view
+                .transactions
+                .into_iter()
+                .map(|transaction| TransactionCheckRequest {
+                    bank_id,
+                    slot,
+                    transaction,
+                });
+
+        for request in requests.by_ref() {
+            let Err(request) = self.transaction_check_queue.try_send(request) else {
+                continue;
+            };
+
+            self.buffered_transaction_check_requests.push_back(request);
+            break;
+        }
+        self.buffered_transaction_check_requests.extend(requests);
     }
 
     fn handle_abort_message(

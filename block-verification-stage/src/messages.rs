@@ -91,7 +91,7 @@ pub(crate) struct SignatureVerificationResponse {
 pub(crate) struct TransactionCheckRequest {
     pub(crate) bank_id: BankId,
     pub(crate) slot: Slot,
-    pub(crate) transactions: Vec<UnsanitizedTransactionView<Bytes>>,
+    pub(crate) transaction: UnsanitizedTransactionView<Bytes>,
 }
 
 #[derive(Debug)]

@@ -7,14 +7,14 @@ use {
 
 pub(crate) const THREAD_NAME_PREFIX: &str = "solBlkVerChk";
 
-/// Sanitizes the transactions and resolves their address lookup tables against the bank of the
+/// Sanitizes the transaction and resolves its address lookup tables against the bank of the
 /// block.
-pub(crate) fn check_transactions(
+pub(crate) fn check_transaction(
     bank_forks: &RwLock<BankForks>,
     TransactionCheckRequest {
         bank_id,
         slot,
-        transactions,
+        transaction,
     }: TransactionCheckRequest,
 ) -> TransactionCheckResponse {
     let bank = bank_forks
@@ -24,11 +24,10 @@ pub(crate) fn check_transactions(
         .filter(|bank| u64::from(bank.bank_id()) == bank_id);
 
     let result = match bank {
-        Some(bank) => transactions.into_iter().try_for_each(|transaction| {
-            bank.verify_transaction(transaction, TransactionVerificationMode::HashOnly)
-                .map(|_resolved_transaction| ())
-                .map_err(TransactionCheckError::InvalidTransaction)
-        }),
+        Some(bank) => bank
+            .verify_transaction(transaction, TransactionVerificationMode::HashOnly)
+            .map(|_resolved_transaction| ())
+            .map_err(TransactionCheckError::InvalidTransaction),
         None => Err(TransactionCheckError::BankNotFound),
     };
 

@@ -709,15 +709,17 @@ fn block_whose_bank_is_not_in_bank_forks_has_bank_not_found_outcome(bank_id: Ban
     assert_matches!(stage.join(), Ok(()));
 }
 
-/// tests that buffered signature verifications get verified
+/// tests that buffered signature verifications and transaction checks get done
 #[test]
-fn block_with_an_entry_larger_than_the_signature_request_queue_passes_verification() {
+fn block_with_an_entry_larger_than_the_request_queues_passes_verification() {
     const NUM_TRANSACTIONS: usize = 100;
     const MAX_SIGNATURE_VERIFICATIONS_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(1).unwrap();
+    const MAX_TRANSACTION_CHECKS_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(1).unwrap();
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let config = SchedulerConfig {
         max_signature_verifications_in_flight: MAX_SIGNATURE_VERIFICATIONS_IN_FLIGHT,
+        max_transaction_checks_in_flight: MAX_TRANSACTION_CHECKS_IN_FLIGHT,
         ..TEST_SCHEDULER_CONFIG
     };
     let stage = run_scheduler(config, shutdown_flag.clone(), new_bank_forks());
