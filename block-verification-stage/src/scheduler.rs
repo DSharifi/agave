@@ -5,23 +5,26 @@ use {
             AbortMessage, AllEntriesSubmittedMessage, BeginMessage, BlockVerificationOutcome,
             BlockVerificationToReplayMessage, EntryHashVerificationRequest,
             EntryHashVerificationResponse, EntryMessage, ReplayToBlockVerificationMessage,
-            SignatureVerificationRequest, SignatureVerificationResponse, VerificationFailureReason,
+            SignatureVerificationRequest, SignatureVerificationResponse, TransactionCheckError,
+            TransactionCheckRequest, TransactionCheckResponse, VerificationFailureReason,
         },
         stage::BlockVerificationStage,
         utils::ShutdownOnDrop,
         workers::{
-            VerificationQueue, VerificationWorkers, entry_hash_verification, signature_verification,
+            VerificationQueue, VerificationWorkers, entry_hash_verification,
+            signature_verification, transaction_check,
         },
     },
     crossbeam_channel::{Receiver, RecvError, Sender, TrySendError, bounded, never, select},
     solana_clock::{BankId, Slot},
     solana_entry::entry::EntryVerificationData,
     solana_hash::Hash,
+    solana_runtime::bank_forks::BankForks,
     std::{
         collections::VecDeque,
         mem,
         sync::{
-            Arc,
+            Arc, RwLock,
             atomic::{AtomicBool, Ordering},
         },
         time::Duration,
@@ -32,6 +35,7 @@ type EntryHashVerificationQueue =
     VerificationQueue<EntryHashVerificationRequest, EntryHashVerificationResponse>;
 type SignatureVerificationQueue =
     VerificationQueue<SignatureVerificationRequest, SignatureVerificationResponse>;
+type TransactionCheckQueue = VerificationQueue<TransactionCheckRequest, TransactionCheckResponse>;
 
 /// The timeout used on waiting for messages before checking for a timeout
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -46,6 +50,8 @@ pub enum SchedulerExitReason {
     EntryHashVerificationWorkersExited,
     #[error("every signature verification worker exited")]
     SignatureVerificationWorkersExited,
+    #[error("every transaction check worker exited")]
+    TransactionCheckWorkersExited,
 }
 
 impl From<DisconnectedResponseChannel> for SchedulerExitReason {
@@ -60,6 +66,7 @@ pub(super) struct BlockVerificationScheduler {
 
     entry_hash_verification_queue: EntryHashVerificationQueue,
     signature_verification_queue: SignatureVerificationQueue,
+    transaction_check_queue: TransactionCheckQueue,
 
     shutdown_signal: Arc<AtomicBool>,
     workers_shutdown_signal: ShutdownOnDrop,
@@ -68,15 +75,18 @@ pub(super) struct BlockVerificationScheduler {
 
     entry_hash_verification_workers: VerificationWorkers,
     signature_verification_workers: VerificationWorkers,
+    transaction_check_workers: VerificationWorkers,
 
     buffered_replay_response_messages: VecDeque<BlockVerificationToReplayMessage>,
     buffered_signature_verification_requests: VecDeque<SignatureVerificationRequest>,
+    buffered_transaction_check_requests: VecDeque<TransactionCheckRequest>,
 }
 
 impl BlockVerificationScheduler {
     pub(super) fn run_scheduler(
         scheduler_config: SchedulerConfig,
         shutdown_signal: Arc<AtomicBool>,
+        bank_forks: Arc<RwLock<BankForks>>,
     ) -> BlockVerificationStage {
         let (
             entry_hash_verification_queue,
@@ -90,6 +100,11 @@ impl BlockVerificationScheduler {
             signature_verification_request_consumer,
             signature_verification_response_sender,
         ) = SignatureVerificationQueue::new(scheduler_config.max_signature_verifications_in_flight);
+        let (
+            transaction_check_queue,
+            transaction_check_request_consumer,
+            transaction_check_response_sender,
+        ) = TransactionCheckQueue::new(scheduler_config.max_transaction_checks_in_flight);
 
         let replay_to_block_verification =
             bounded(scheduler_config.replay_to_block_verification_channel_size);
@@ -114,16 +129,26 @@ impl BlockVerificationScheduler {
             signature_verification_response_sender,
             signature_verification::verify_signatures,
         );
+        let transaction_check_workers = VerificationWorkers::spawn(
+            transaction_check::THREAD_NAME_PREFIX,
+            workers_shutdown_signal.signal().clone(),
+            scheduler_config.num_transaction_check_workers,
+            transaction_check_request_consumer,
+            transaction_check_response_sender,
+            move |request| transaction_check::check_transaction(&bank_forks, request),
+        );
 
         let scheduler = Self::new(
             replay_to_block_verification.1,
             block_verification_to_replay.0,
             entry_hash_verification_queue,
             signature_verification_queue,
+            transaction_check_queue,
             shutdown_signal,
             workers_shutdown_signal,
             entry_hash_verification_workers,
             signature_verification_workers,
+            transaction_check_workers,
         );
 
         let scheduler_thread_join_handle =
@@ -136,28 +161,34 @@ impl BlockVerificationScheduler {
         )
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn new(
         replay_message_receiver: Receiver<ReplayToBlockVerificationMessage>,
         replay_message_sender: Sender<BlockVerificationToReplayMessage>,
         entry_hash_verification_queue: EntryHashVerificationQueue,
         signature_verification_queue: SignatureVerificationQueue,
+        transaction_check_queue: TransactionCheckQueue,
         shutdown_signal: Arc<AtomicBool>,
         workers_shutdown_signal: ShutdownOnDrop,
         entry_hash_verification_workers: VerificationWorkers,
         signature_verification_workers: VerificationWorkers,
+        transaction_check_workers: VerificationWorkers,
     ) -> Self {
         Self {
             replay_message_receiver,
             replay_message_sender,
             entry_hash_verification_queue,
             signature_verification_queue,
+            transaction_check_queue,
             shutdown_signal,
             workers_shutdown_signal,
             blocks_in_progress: Vec::new(),
             buffered_replay_response_messages: VecDeque::new(),
             buffered_signature_verification_requests: VecDeque::new(),
+            buffered_transaction_check_requests: VecDeque::new(),
             entry_hash_verification_workers,
             signature_verification_workers,
+            transaction_check_workers,
         }
     }
 
@@ -169,6 +200,7 @@ impl BlockVerificationScheduler {
         while !self.shutdown_signal.load(Ordering::Relaxed) {
             self.try_flush_buffered_replay_responses()?;
             self.try_flush_buffered_signature_verification_requests();
+            self.try_flush_buffered_transaction_check_requests();
 
             let replay_message_receiver = if self.workers_can_accept_request() {
                 &self.replay_message_receiver
@@ -187,6 +219,10 @@ impl BlockVerificationScheduler {
                     let response = response.map_err(|_: RecvError| SchedulerExitReason::SignatureVerificationWorkersExited)?;
                     let () = self.handle_signature_verification_response(response)?;
                 }
+                recv(self.transaction_check_queue.response_receiver()) -> response => {
+                    let response = response.map_err(|_: RecvError| SchedulerExitReason::TransactionCheckWorkersExited)?;
+                    let () = self.handle_transaction_check_response(response)?;
+                }
                 recv(replay_message_receiver) -> replay_message => {
                     let replay_message = replay_message.map_err(|_: RecvError| SchedulerExitReason::DisconnectedRequestChannel)?;
                     let () = self.handle_replay_message(replay_message)?;
@@ -199,8 +235,10 @@ impl BlockVerificationScheduler {
             mut workers_shutdown_signal,
             entry_hash_verification_queue,
             signature_verification_queue,
+            transaction_check_queue,
             entry_hash_verification_workers,
             signature_verification_workers,
+            transaction_check_workers,
             ..
         } = self;
 
@@ -209,8 +247,10 @@ impl BlockVerificationScheduler {
         workers_shutdown_signal.shutdown();
         drop(entry_hash_verification_queue);
         drop(signature_verification_queue);
+        drop(transaction_check_queue);
         let () = entry_hash_verification_workers.join_workers();
         let () = signature_verification_workers.join_workers();
+        let () = transaction_check_workers.join_workers();
 
         Ok(())
     }
@@ -218,7 +258,9 @@ impl BlockVerificationScheduler {
     fn workers_can_accept_request(&self) -> bool {
         self.entry_hash_verification_queue.can_send_request()
             && self.signature_verification_queue.can_send_request()
+            && self.transaction_check_queue.can_send_request()
             && self.buffered_signature_verification_requests.is_empty()
+            && self.buffered_transaction_check_requests.is_empty()
     }
 
     fn try_flush_buffered_signature_verification_requests(&mut self) {
@@ -226,6 +268,15 @@ impl BlockVerificationScheduler {
             if let Err(request) = self.signature_verification_queue.try_send(request) {
                 self.buffered_signature_verification_requests
                     .push_front(request);
+                break;
+            }
+        }
+    }
+
+    fn try_flush_buffered_transaction_check_requests(&mut self) {
+        while let Some(request) = self.buffered_transaction_check_requests.pop_front() {
+            if let Err(request) = self.transaction_check_queue.try_send(request) {
+                self.buffered_transaction_check_requests.push_front(request);
                 break;
             }
         }
@@ -349,26 +400,49 @@ impl BlockVerificationScheduler {
                  transactions of one entry",
             );
 
+        let mut requests = entry_view.transactions.iter().cloned().map(|transaction| {
+            SignatureVerificationRequest {
+                bank_id,
+                transaction,
+            }
+        });
+
+        for request in requests.by_ref() {
+            if let Err(request) = self.signature_verification_queue.try_send(request) {
+                self.buffered_signature_verification_requests
+                    .push_back(request);
+                break;
+            }
+        }
+        self.buffered_signature_verification_requests
+            .extend(requests);
+
+        progress_tracker.transaction_check_jobs_pending = progress_tracker
+            .transaction_check_jobs_pending
+            .checked_add(entry_view.transactions.len())
+            .expect(
+                "the jobs pending of a block are bounded by the request queue size and the \
+                 transactions of one entry",
+            );
+
+        let slot = block_verification_state.slot;
         let mut requests =
             entry_view
                 .transactions
                 .into_iter()
-                .map(|transaction| SignatureVerificationRequest {
+                .map(|transaction| TransactionCheckRequest {
                     bank_id,
+                    slot,
                     transaction,
                 });
 
         for request in requests.by_ref() {
-            let Err(request) = self.signature_verification_queue.try_send(request) else {
-                continue;
-            };
-
-            self.buffered_signature_verification_requests
-                .push_back(request);
-            break;
+            if let Err(request) = self.transaction_check_queue.try_send(request) {
+                self.buffered_transaction_check_requests.push_back(request);
+                break;
+            }
         }
-        self.buffered_signature_verification_requests
-            .extend(requests);
+        self.buffered_transaction_check_requests.extend(requests);
     }
 
     fn handle_abort_message(
@@ -456,6 +530,39 @@ impl BlockVerificationScheduler {
         self.try_release_block(block_verification_state)
     }
 
+    fn handle_transaction_check_response(
+        &mut self,
+        TransactionCheckResponse { bank_id, result }: TransactionCheckResponse,
+    ) -> Result<(), DisconnectedResponseChannel> {
+        self.transaction_check_queue.complete_request();
+
+        let mut block_verification_state = self
+            .take_block_verification_state(&bank_id)
+            .expect("a block is only released once none of its requests are in flight");
+
+        let progress_tracker = &mut block_verification_state.progress_tracker;
+
+        progress_tracker.transaction_check_jobs_pending = progress_tracker
+            .transaction_check_jobs_pending
+            .checked_sub(1)
+            .expect("each response for a block answers a request counted as pending when sent");
+
+        if let Err(error) = result
+            && block_verification_state.tracking_state == BlockTrackingState::InProgress
+        {
+            block_verification_state.tracking_state = match error {
+                TransactionCheckError::BankNotFound => BlockTrackingState::BankNotFound,
+                TransactionCheckError::InvalidTransaction(transaction_error) => {
+                    BlockTrackingState::Invalidated(VerificationFailureReason::InvalidTransaction(
+                        transaction_error,
+                    ))
+                }
+            };
+        }
+
+        self.try_release_block(block_verification_state)
+    }
+
     /// Takes the state of the block being verified in `bank_id` out of the scheduler state.
     fn take_block_verification_state(
         &mut self,
@@ -519,24 +626,26 @@ impl BlockVerificationState {
             return None;
         }
 
-        match self.tracking_state {
+        match &self.tracking_state {
             BlockTrackingState::InProgress => self
                 .progress_tracker
                 .all_entries_are_submitted
                 .then_some(BlockVerificationOutcome::Verified),
             BlockTrackingState::Aborted => Some(BlockVerificationOutcome::Aborted),
-            BlockTrackingState::Invalidated(failure_reason) => {
-                Some(BlockVerificationOutcome::VerificationFailed(failure_reason))
-            }
+            BlockTrackingState::BankNotFound => Some(BlockVerificationOutcome::BankNotFound),
+            BlockTrackingState::Invalidated(failure_reason) => Some(
+                BlockVerificationOutcome::VerificationFailed(failure_reason.clone()),
+            ),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum BlockTrackingState {
     InProgress,
     Aborted,
     Invalidated(VerificationFailureReason),
+    BankNotFound,
 }
 
 #[derive(Debug)]
@@ -547,11 +656,14 @@ struct BlockVerificationStatus {
     all_entries_are_submitted: bool,
     entry_hash_jobs_pending: usize,
     signature_jobs_pending: usize,
+    transaction_check_jobs_pending: usize,
 }
 
 impl BlockVerificationStatus {
     fn has_jobs_pending(&self) -> bool {
-        self.entry_hash_jobs_pending > 0 || self.signature_jobs_pending > 0
+        self.entry_hash_jobs_pending > 0
+            || self.signature_jobs_pending > 0
+            || self.transaction_check_jobs_pending > 0
     }
 }
 
@@ -575,12 +687,14 @@ mod tests {
     const SLOT: Slot = 120;
     const ENTRY_HASH_VERIFICATION_QUEUE_SIZE: usize = 8;
     const SIGNATURE_VERIFICATION_QUEUE_SIZE: usize = 4;
+    const TRANSACTION_CHECK_QUEUE_SIZE: usize = 6;
     const OUTCOME_CHANNEL_SIZE: usize = 64;
 
     struct ManuallyDrivenScheduler {
         scheduler: BlockVerificationScheduler,
         entry_hash_verification_request_consumer: mpmc::Consumer<EntryHashVerificationRequest>,
         signature_verification_request_consumer: mpmc::Consumer<SignatureVerificationRequest>,
+        transaction_check_request_consumer: mpmc::Consumer<TransactionCheckRequest>,
         outcome_receiver: Receiver<BlockVerificationToReplayMessage>,
     }
 
@@ -596,6 +710,8 @@ mod tests {
                 VerificationQueue::new(
                     NonZeroUsize::new(SIGNATURE_VERIFICATION_QUEUE_SIZE).unwrap(),
                 );
+            let (transaction_check_queue, transaction_check_request_consumer, _) =
+                VerificationQueue::new(NonZeroUsize::new(TRANSACTION_CHECK_QUEUE_SIZE).unwrap());
             let (outcome_sender, outcome_receiver) = bounded(OUTCOME_CHANNEL_SIZE);
             let message_receiver = never();
 
@@ -604,8 +720,10 @@ mod tests {
                 outcome_sender,
                 entry_hash_verification_queue,
                 signature_verification_queue,
+                transaction_check_queue,
                 Arc::new(AtomicBool::new(false)),
                 ShutdownOnDrop::from(Arc::new(AtomicBool::new(false))),
+                VerificationWorkers::none(),
                 VerificationWorkers::none(),
                 VerificationWorkers::none(),
             );
@@ -614,6 +732,7 @@ mod tests {
                 scheduler,
                 entry_hash_verification_request_consumer,
                 signature_verification_request_consumer,
+                transaction_check_request_consumer,
                 outcome_receiver,
             }
         }
@@ -683,6 +802,20 @@ mod tests {
                 .unwrap();
         }
 
+        /// Answers the oldest request in the queue
+        fn respond_transaction_check(&mut self, result: Result<(), TransactionCheckError>) {
+            let request = self
+                .transaction_check_request_consumer
+                .try_read()
+                .expect("tests only respond to requests the scheduler sent");
+            self.scheduler
+                .handle_transaction_check_response(TransactionCheckResponse {
+                    bank_id: request.bank_id,
+                    result,
+                })
+                .unwrap();
+        }
+
         fn try_recv_outcome(&self) -> Option<BlockVerificationToReplayMessage> {
             match self.outcome_receiver.try_recv() {
                 Ok(outcome) => Some(outcome),
@@ -703,6 +836,10 @@ mod tests {
             self.scheduler
                 .signature_verification_queue
                 .requests_in_flight()
+        }
+
+        fn transaction_check_requests_in_flight(&self) -> usize {
+            self.scheduler.transaction_check_queue.requests_in_flight()
         }
     }
 
@@ -902,6 +1039,7 @@ mod tests {
 
         scheduler.respond_entry_hash(true);
         scheduler.respond_entry_hash(true);
+        scheduler.respond_transaction_check(Ok(()));
 
         scheduler.notify_all_entries_submitted(BANK_ID);
         assert_eq!(
@@ -935,6 +1073,7 @@ mod tests {
         );
 
         scheduler.respond_entry_hash(true);
+        scheduler.respond_transaction_check(Ok(()));
         assert_eq!(
             scheduler.try_recv_outcome(),
             Some(BlockVerificationToReplayMessage {
@@ -969,6 +1108,83 @@ mod tests {
         );
 
         scheduler.respond_signatures(true);
+        assert!(
+            scheduler.scheduler.workers_can_accept_request(),
+            "a response must free up room for a request"
+        );
+
+        // The freed room can be used, so the next entry is sent without the queue overflowing.
+        scheduler.submit_entries(BANK_ID, arbitrary_entries_with_a_transaction(1));
+    }
+
+    #[test]
+    fn last_transaction_check_response_after_all_entries_submitted_verifies_block() {
+        let mut scheduler = ManuallyDrivenScheduler::new();
+
+        scheduler.begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH);
+        scheduler.submit_entries(BANK_ID, arbitrary_entries(1));
+
+        assert_eq!(
+            scheduler.transaction_check_requests_in_flight(),
+            0,
+            "a tick entry should not schedule transaction check work"
+        );
+        scheduler.submit_entries(BANK_ID, arbitrary_entries_with_a_transaction(1));
+
+        scheduler.respond_entry_hash(true);
+        scheduler.respond_entry_hash(true);
+        scheduler.respond_signatures(true);
+
+        scheduler.notify_all_entries_submitted(BANK_ID);
+        assert_eq!(
+            scheduler.try_recv_outcome(),
+            None,
+            "a block must not complete while transaction checks are in flight"
+        );
+
+        scheduler.respond_transaction_check(Ok(()));
+        assert_eq!(
+            scheduler.try_recv_outcome(),
+            Some(BlockVerificationToReplayMessage {
+                slot: SLOT,
+                bank_id: BANK_ID,
+                verification_status: BlockVerificationOutcome::Verified,
+            })
+        );
+    }
+
+    #[test]
+    fn transaction_check_workers_cause_backpressure_to_replay_channel() {
+        let mut scheduler = ManuallyDrivenScheduler::new();
+
+        scheduler.begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH);
+        // The signature request queue is smaller, so its requests are answered to keep it from
+        // filling up first.
+        for _ in 0..TRANSACTION_CHECK_QUEUE_SIZE {
+            scheduler.submit_entries(BANK_ID, arbitrary_entries_with_a_transaction(1));
+            scheduler.respond_signatures(true);
+        }
+        assert!(
+            scheduler
+                .scheduler
+                .entry_hash_verification_queue
+                .can_send_request(),
+            "the entry hash request queue is larger than the transaction check request queue"
+        );
+        assert!(
+            scheduler
+                .scheduler
+                .signature_verification_queue
+                .can_send_request(),
+            "every signature request was answered"
+        );
+        assert!(
+            !scheduler.scheduler.workers_can_accept_request(),
+            "replay messages must not be received while the transaction check request queue is \
+             full"
+        );
+
+        scheduler.respond_transaction_check(Ok(()));
         assert!(
             scheduler.scheduler.workers_can_accept_request(),
             "a response must free up room for a request"

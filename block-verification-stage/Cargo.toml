@@ -18,15 +18,21 @@ shaq = { workspace = true }
 solana-clock = { workspace = true }
 solana-entry = { workspace = true }
 solana-hash = { workspace = true }
+solana-runtime = { workspace = true }
 solana-signature = { workspace = true, features = ["verify"] }
+solana-transaction = { workspace = true }
+solana-transaction-error = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 solana-entry = { workspace = true, features = ["dev-context-only-utils"] }
 solana-keypair = { workspace = true }
+solana-leader-schedule = { workspace = true }
+solana-message = { workspace = true }
+solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }
 solana-signer = { workspace = true }
+solana-system-interface = { workspace = true }
 solana-system-transaction = { workspace = true }
-solana-transaction = { workspace = true }
 test-case = { workspace = true }
 
 [lints]

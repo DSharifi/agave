@@ -4,6 +4,7 @@ use {
     solana_clock::{BankId, Slot},
     solana_entry::entry::{EntryVerificationData, EntryView},
     solana_hash::Hash,
+    solana_transaction_error::TransactionError,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -11,12 +12,15 @@ pub enum BlockVerificationOutcome {
     Verified,
     VerificationFailed(VerificationFailureReason),
     Aborted,
+    /// The bank of the block was not in bank forks when its transactions were checked.
+    BankNotFound,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationFailureReason {
     InvalidEntryHash,
     InvalidSignature,
+    InvalidTransaction(TransactionError),
 }
 
 #[derive(Debug)]
@@ -81,4 +85,23 @@ pub(crate) struct SignatureVerificationRequest {
 pub(crate) struct SignatureVerificationResponse {
     pub(crate) bank_id: BankId,
     pub(crate) verified: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct TransactionCheckRequest {
+    pub(crate) bank_id: BankId,
+    pub(crate) slot: Slot,
+    pub(crate) transaction: UnsanitizedTransactionView<Bytes>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TransactionCheckResponse {
+    pub(crate) bank_id: BankId,
+    pub(crate) result: Result<(), TransactionCheckError>,
+}
+
+#[derive(Debug)]
+pub(crate) enum TransactionCheckError {
+    BankNotFound,
+    InvalidTransaction(TransactionError),
 }
