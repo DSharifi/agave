@@ -408,13 +408,11 @@ impl BlockVerificationScheduler {
         });
 
         for request in requests.by_ref() {
-            let Err(request) = self.signature_verification_queue.try_send(request) else {
-                continue;
-            };
-
-            self.buffered_signature_verification_requests
-                .push_back(request);
-            break;
+            if let Err(request) = self.signature_verification_queue.try_send(request) {
+                self.buffered_signature_verification_requests
+                    .push_back(request);
+                break;
+            }
         }
         self.buffered_signature_verification_requests
             .extend(requests);
@@ -439,12 +437,10 @@ impl BlockVerificationScheduler {
                 });
 
         for request in requests.by_ref() {
-            let Err(request) = self.transaction_check_queue.try_send(request) else {
-                continue;
-            };
-
-            self.buffered_transaction_check_requests.push_back(request);
-            break;
+            if let Err(request) = self.transaction_check_queue.try_send(request) {
+                self.buffered_transaction_check_requests.push_back(request);
+                break;
+            }
         }
         self.buffered_transaction_check_requests.extend(requests);
     }
