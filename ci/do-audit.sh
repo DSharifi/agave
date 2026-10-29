@@ -72,6 +72,57 @@ xtask_cargo_audit_extra_args=(
   --ignore RUSTSEC-2023-0071
 )
 
+# Prints "<advisory id> <crate> <version>" for each vulnerability that
+# `cargo audit` finds in the given lock file. Fails if no report is produced.
+list_vulnerabilities() {
+  local lock_file="$1"
+  shift
+  cargo audit --no-fetch --json --file "$lock_file" "$@" </dev/null |
+    jq -nr 'input | .vulnerabilities.list[] | "\(.advisory.id) \(.package.name) \(.package.version)"'
+}
+
+# On pull requests, only fail on vulnerabilities the target branch doesn't
+# already have, so a new advisory against an existing dependency doesn't block
+# unrelated PRs. Pushes still fail on every vulnerability (see
+# ci/buildkite-secondary.yml), so the target branch itself gets fixed.
+base_ref=
+if [[ -n $CI_PULL_REQUEST && -n $CI_BASE_BRANCH ]]; then
+  if git fetch --quiet origin "$CI_BASE_BRANCH"; then
+    base_ref="$(git rev-parse FETCH_HEAD)"
+  else
+    echo "WARNING: failed to fetch origin/$CI_BASE_BRANCH, failing on all vulnerabilities" >&2
+  fi
+fi
+
+# Succeeds if every vulnerability in the given lock file is also in that lock
+# file on $base_ref.
+only_preexisting_vulnerabilities() {
+  local lock_file="$1"
+  shift
+
+  local head_vulnerabilities base_vulnerabilities= new_vulnerabilities
+  # an empty list means `cargo audit` failed for some other reason
+  head_vulnerabilities="$(list_vulnerabilities "$lock_file" "$@")" || return 1
+  [[ -n $head_vulnerabilities ]] || return 1
+
+  local base_lock_file
+  base_lock_file="$(mktemp)"
+  if git show "$base_ref:$lock_file" >"$base_lock_file" 2>/dev/null; then
+    base_vulnerabilities="$(list_vulnerabilities "$base_lock_file" "$@")" || base_vulnerabilities=
+  fi
+  rm -f "$base_lock_file"
+
+  new_vulnerabilities="$(comm -23 <(sort -u <<<"$head_vulnerabilities") <(sort -u <<<"$base_vulnerabilities"))"
+  if [[ -n $new_vulnerabilities ]]; then
+    echo "[$lock_file]: vulnerabilities not on $CI_BASE_BRANCH (rebase if they were fixed there):"
+    sed 's/^/  /' <<<"$new_vulnerabilities"
+    return 1
+  fi
+
+  echo "[$lock_file]: not failing this PR, these vulnerabilities already exist on $CI_BASE_BRANCH:"
+  sed 's/^/  /' <<<"$head_vulnerabilities"
+}
+
 lock_files="$(git ls-files ':**Cargo.lock')"
 
 for lock_file in $lock_files; do
@@ -97,6 +148,9 @@ for lock_file in $lock_files; do
 
   exit_code="${pipeline_status[0]}"
   if [[ $exit_code -ne 0 ]]; then
+    if [[ -n $base_ref ]] && only_preexisting_vulnerabilities "$lock_file" "${audit_extra_args[@]}"; then
+      continue
+    fi
     exit "$exit_code"
   fi
 done
