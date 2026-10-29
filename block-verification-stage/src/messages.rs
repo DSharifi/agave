@@ -1,7 +1,8 @@
 use {
     agave_transaction_view::transaction_view::UnsanitizedTransactionView,
     bytes::Bytes,
-    solana_clock::{BankId, Slot},
+    solana_accounts_db::bank_id::BankId,
+    solana_clock::Slot,
     solana_entry::entry::{EntryVerificationData, EntryView},
     solana_hash::Hash,
     solana_transaction_error::TransactionError,
