@@ -34,6 +34,8 @@
 //!     VerificationFailed  ──► an entry failed verification, possibly before all entries were
 //!                             submitted. Entries submitted afterwards are ignored
 //!     Aborted             ──► aborted before verification finished
+//!     BankNotFound        ──► the bank of the block was not in bank forks when its transactions
+//!                             were checked
 //!   An abort arriving after the outcome was sent is ignored.
 //!
 //!   Every transition fails with an error if the scheduler has shut down.

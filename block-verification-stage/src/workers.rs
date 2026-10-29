@@ -1,5 +1,6 @@
 pub(crate) mod entry_hash_verification;
 pub(crate) mod signature_verification;
+pub(crate) mod transaction_check;
 
 use {
     crate::join_thread,
@@ -109,13 +110,14 @@ impl VerificationWorkers {
         num_workers: NonZeroUsize,
         request_consumer: mpmc::Consumer<Request>,
         response_sender: Sender<Response>,
-        verify: fn(Request) -> Response,
+        verify: impl Fn(Request) -> Response + Clone + Send + 'static,
     ) -> Self {
         let worker_handles = (0..num_workers.get())
             .map(|index| {
                 let request_consumer = request_consumer.clone();
                 let response_sender = response_sender.clone();
                 let exit = shutdown_signal.clone();
+                let verify = verify.clone();
                 thread::Builder::new()
                     .name(format!("{thread_name_prefix}{index}"))
                     .spawn(move || run_worker(&request_consumer, &response_sender, &exit, verify))
@@ -145,7 +147,7 @@ fn run_worker<Request, Response>(
     request_consumer: &mpmc::Consumer<Request>,
     response_sender: &Sender<Response>,
     shutdown_signal: &AtomicBool,
-    verify: fn(Request) -> Response,
+    verify: impl Fn(Request) -> Response,
 ) {
     while !shutdown_signal.load(Ordering::Relaxed) {
         let verification_request = match request_consumer.read_timeout(EXIT_POLL_INTERVAL) {
