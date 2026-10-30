@@ -5,7 +5,8 @@ use {
         stage::{BlockVerificationSession, Started},
     },
     bytes::Bytes,
-    solana_clock::{BankId, Slot},
+    solana_accounts_db::bank_id::BankId,
+    solana_clock::Slot,
     solana_entry::entry::{EntryView, entry_views_for_tests, next_entry_mut},
     solana_hash::Hash,
     solana_keypair::Keypair,
@@ -35,7 +36,7 @@ pub const TEST_SCHEDULER_CONFIG: SchedulerConfig = SchedulerConfig {
 pub const BOGUS_HASH: Hash = Hash::new_from_array([1; _]);
 pub const PARENT_BANK_LAST_ENTRY_HASH: Hash = Hash::new_from_array([2; _]);
 /// The bank id of the first bank created from a root bank.
-pub const BANK_ID: BankId = 1;
+pub const BANK_ID: BankId = BankId::new(1);
 pub const SLOT: Slot = 120;
 pub const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -46,7 +47,7 @@ pub fn new_bank_forks() -> Arc<RwLock<BankForks>> {
     // The root bank lacks the slot hashes sysvar that address lookup tables are resolved with.
     let bank =
         Bank::new_from_parent_with_bank_forks(&bank_forks, root_bank, SlotLeader::default(), SLOT);
-    assert_eq!(u64::from(bank.bank_id()), BANK_ID);
+    assert_eq!(bank.bank_id(), BANK_ID);
     bank_forks
 }
 

@@ -15,6 +15,7 @@ agave-transaction-view = { workspace = true }
 bytes = { workspace = true }
 crossbeam-channel = { workspace = true }
 shaq = { workspace = true }
+solana-accounts-db = { workspace = true }
 solana-clock = { workspace = true }
 solana-entry = { workspace = true }
 solana-hash = { workspace = true }

@@ -15,7 +15,8 @@ use {
     },
     crossbeam_channel::RecvTimeoutError,
     helpers::BANK_ID,
-    solana_clock::{BankId, Slot},
+    solana_accounts_db::bank_id::BankId,
+    solana_clock::Slot,
     solana_entry::entry::{
         entry_views_for_tests, next_entry, next_entry_mut, next_versioned_entry,
     },
@@ -179,11 +180,11 @@ fn outcomes_of_concurrent_blocks_are_sent_in_completion_order() {
         new_bank_forks(),
     );
 
-    const FIRST_BANK_ID: BankId = 1;
+    const FIRST_BANK_ID: BankId = BankId::new(1);
     const FIRST_SLOT: Slot = 120;
-    const SECOND_BANK_ID: BankId = 2;
+    const SECOND_BANK_ID: BankId = BankId::new(2);
     const SECOND_SLOT: Slot = 121;
-    const THIRD_BANK_ID: BankId = 3;
+    const THIRD_BANK_ID: BankId = BankId::new(3);
     const THIRD_SLOT: Slot = 122;
 
     let first_session: BlockVerificationSession<Started> = stage
@@ -247,9 +248,9 @@ fn outcomes_of_concurrent_blocks_are_sent_in_completion_order() {
 
 // Beginning a block whose bank id or slot is still in progress violates a scheduler invariant,
 // which panics the scheduler thread.
-#[test_case(1, 120, 1, 121; "reused_bank_id")]
-#[test_case(1, 120, 2, 120; "reused_slot")]
-#[test_case(1, 120, 1, 120; "reused_slot_and_bank_id")]
+#[test_case(BankId::new(1), 120, BankId::new(1), 121; "reused_bank_id")]
+#[test_case(BankId::new(1), 120, BankId::new(2), 120; "reused_slot")]
+#[test_case(BankId::new(1), 120, BankId::new(1), 120; "reused_slot_and_bank_id")]
 #[should_panic = "internal invariant violated. A duplicate"]
 fn reusing_bank_id_or_slot_in_progress_panics_scheduler(
     first_bank_id: BankId,
@@ -365,7 +366,7 @@ fn block_with_invalid_entry_fails_verification_before_all_entries_are_submitted(
 
     const NUM_ENTRIES: usize = 10;
     const NUM_ENTRIES_SUBMITTED_BEFORE_FAILURE: usize = 5;
-    const NEXT_BANK_ID: BankId = BANK_ID + 1;
+    const NEXT_BANK_ID: BankId = BankId::new(2);
     const NEXT_SLOT: Slot = SLOT + 1;
 
     let mut entries_submitted_with_failure =
@@ -677,7 +678,7 @@ fn block_with_transaction_using_missing_address_lookup_table_fails_verification(
 // A bank missing from bank forks says nothing about whether the block is valid, so the block does
 // not fail verification. Bank forks only has `BANK_ID` at `SLOT`.
 #[test_case(BANK_ID, SLOT + 1; "missing_slot")]
-#[test_case(BANK_ID + 1, SLOT; "replaced_bank")]
+#[test_case(BankId::new(2), SLOT; "replaced_bank")]
 fn block_whose_bank_is_not_in_bank_forks_has_bank_not_found_outcome(bank_id: BankId, slot: Slot) {
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let stage = run_scheduler(

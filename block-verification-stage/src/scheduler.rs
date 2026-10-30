@@ -16,7 +16,8 @@ use {
         },
     },
     crossbeam_channel::{Receiver, RecvError, Sender, TrySendError, bounded, never, select},
-    solana_clock::{BankId, Slot},
+    solana_accounts_db::bank_id::BankId,
+    solana_clock::Slot,
     solana_entry::entry::EntryVerificationData,
     solana_hash::Hash,
     solana_runtime::bank_forks::BankForks,
@@ -683,7 +684,7 @@ mod tests {
     };
 
     const PARENT_BANK_LAST_ENTRY_HASH: Hash = Hash::new_from_array([2; _]);
-    const BANK_ID: BankId = 123;
+    const BANK_ID: BankId = BankId::new(123);
     const SLOT: Slot = 120;
     const ENTRY_HASH_VERIFICATION_QUEUE_SIZE: usize = 8;
     const SIGNATURE_VERIFICATION_QUEUE_SIZE: usize = 4;
