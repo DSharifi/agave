@@ -1398,6 +1398,7 @@ dependencies = [
  "bytes",
  "crossbeam-channel",
  "shaq",
+ "solana-accounts-db",
  "solana-clock",
  "solana-entry",
  "solana-hash",

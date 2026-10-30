@@ -21,7 +21,7 @@ pub(crate) fn check_transaction(
         .read()
         .unwrap()
         .get(slot)
-        .filter(|bank| u64::from(bank.bank_id()) == bank_id);
+        .filter(|bank| bank.bank_id() == bank_id);
 
     let result = match bank {
         Some(bank) => bank
