@@ -34,6 +34,8 @@ pub const TEST_SCHEDULER_CONFIG: SchedulerConfig = SchedulerConfig {
     max_signature_verifications_in_flight: NonZeroUsize::new(16).unwrap(),
     num_transaction_check_workers: NonZeroUsize::new(2).unwrap(),
     max_transaction_checks_in_flight: NonZeroUsize::new(16).unwrap(),
+    num_transaction_execution_workers: NonZeroUsize::new(2).unwrap(),
+    max_transaction_executions_in_flight: NonZeroUsize::new(16).unwrap(),
 };
 pub const BOGUS_HASH: Hash = Hash::new_from_array([1; _]);
 pub const PARENT_BANK_LAST_ENTRY_HASH: Hash = Hash::new_from_array([2; _]);

@@ -1,7 +1,7 @@
 use {
     crate::helpers::{
-        BOGUS_HASH, PARENT_BANK_LAST_ENTRY_HASH, RECV_TIMEOUT, SLOT, TEST_SCHEDULER_CONFIG,
-        TestBank, recv_outcome, sign, submit_entries, transfer,
+        BOGUS_HASH, PARENT_BANK_LAST_ENTRY_HASH, PAYER_LAMPORTS, RECV_TIMEOUT, SLOT,
+        TEST_SCHEDULER_CONFIG, TestBank, recv_outcome, sign, submit_entries, transfer,
     },
     block_verification_stage::{
         SchedulerConfig,
@@ -22,6 +22,7 @@ use {
         state::{AddressLookupTable, LookupTableMeta},
     },
     solana_clock::Slot,
+    solana_cost_model::cost_tracker::CostTrackerLimits,
     solana_entry::entry::{
         entry_views_for_tests, next_entry, next_entry_mut, next_versioned_entry,
     },
@@ -31,16 +32,20 @@ use {
     solana_runtime_transaction::transaction_limits::MAX_V1_ACCOUNTS,
     solana_signer::Signer,
     solana_system_interface::instruction as system_instruction,
+    solana_system_transaction as system_transaction,
     solana_transaction::versioned::VersionedTransaction,
     solana_transaction_error::TransactionError,
     std::{
         assert_matches,
         borrow::Cow,
+        iter,
         num::NonZeroUsize,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
         },
+        thread,
+        time::{Duration, Instant},
     },
     test_case::test_case,
 };
@@ -254,6 +259,71 @@ fn outcomes_of_concurrent_blocks_are_sent_in_completion_order() {
     assert_matches!(stage.join(), Ok(()));
 }
 
+// The outcome of a block tells replay that no worker uses its bank any more, so a block aborted
+// while one of its transactions executes gets its outcome only once that execution is done.
+#[test]
+fn aborting_block_while_its_transaction_executes_sends_aborted_once_the_execution_is_done() {
+    // Long enough for the scheduler to handle the abort, were it to send the outcome right away.
+    const NO_OUTCOME_TIMEOUT: Duration = Duration::from_millis(100);
+
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let test_bank = TestBank::new();
+    let bank = test_bank.bank();
+    let stage = run_scheduler(
+        TEST_SCHEDULER_CONFIG,
+        shutdown_flag.clone(),
+        test_bank.bank_forks(),
+    );
+
+    let transaction = test_bank.transfer(&Keypair::new(), 1);
+    let signature = transaction.signatures[0];
+
+    // The execution of a transaction adds its cost to the block once the transaction is committed,
+    // so holding the cost tracker of the bank keeps the committed transaction executing.
+    let cost_tracker = bank.read_cost_tracker().unwrap();
+
+    let session: BlockVerificationSession<Started> = stage
+        .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+    submit_entries(
+        &session,
+        entry_views_for_tests(vec![next_entry(
+            &PARENT_BANK_LAST_ENTRY_HASH,
+            3,
+            vec![transaction],
+        )]),
+    );
+
+    let waiting_since = Instant::now();
+    while bank.get_signature_status(&signature).is_none() {
+        assert!(
+            waiting_since.elapsed() < RECV_TIMEOUT,
+            "the transaction must be committed"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let _session: BlockVerificationSession<Aborted> = session.abort_block_verification().unwrap();
+    assert_matches!(
+        stage
+            .scheduler_message_receiver()
+            .recv_timeout(NO_OUTCOME_TIMEOUT),
+        Err(RecvTimeoutError::Timeout)
+    );
+
+    drop(cost_tracker);
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: BlockVerificationOutcome::Aborted,
+        }
+    );
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
+}
+
 // Beginning a block whose bank id or slot is still in progress violates a scheduler invariant,
 // which panics the scheduler thread.
 #[test_case(BankId::new(1), 120, BankId::new(1), 121; "reused_bank_id")]
@@ -348,6 +418,78 @@ fn block_with_valid_entries_passes_verification(num_signatures: u8) {
             verification_status: BlockVerificationOutcome::Verified,
         }
     );
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
+}
+
+// Each transfer is paid by the recipient of the transfer before it, whose account only exists once
+// that transfer is committed. So the block only passes verification when its transactions execute
+// in block order.
+#[test]
+fn transactions_execute_in_block_order_and_are_committed_to_the_bank() {
+    const NUM_TRANSFERS: usize = 20;
+    const TRANSFERRED_LAMPORTS: u64 = 1_000;
+
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let test_bank = TestBank::new();
+    let stage = run_scheduler(
+        TEST_SCHEDULER_CONFIG,
+        shutdown_flag.clone(),
+        test_bank.bank_forks(),
+    );
+
+    let payers: Vec<_> = iter::once(test_bank.payer().insecure_clone())
+        .chain(iter::repeat_with(Keypair::new))
+        .take(NUM_TRANSFERS.checked_add(1).unwrap())
+        .collect();
+    let transactions: Vec<_> = payers
+        .iter()
+        .zip(payers.iter().skip(1))
+        .map(|(payer, recipient)| {
+            system_transaction::transfer(
+                payer,
+                &recipient.pubkey(),
+                TRANSFERRED_LAMPORTS,
+                test_bank.recent_blockhash(),
+            )
+        })
+        .collect();
+
+    // The transfers are spread over several entries, as checks of different entries can finish
+    // out of order too.
+    let mut hash = PARENT_BANK_LAST_ENTRY_HASH;
+    let entries = transactions
+        .chunks(3)
+        .map(|transactions| next_entry_mut(&mut hash, 3, transactions.to_vec()))
+        .collect();
+
+    let session: BlockVerificationSession<Started> = stage
+        .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+    submit_entries(&session, entry_views_for_tests(entries));
+    let _session: BlockVerificationSession<AllEntriesSubmitted> =
+        session.notify_all_entries_submitted().unwrap();
+
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: BlockVerificationOutcome::Verified,
+        }
+    );
+
+    // Transaction fees are zero in the test banks.
+    let bank = test_bank.bank();
+    let balances: Vec<_> = payers
+        .iter()
+        .map(|payer| bank.get_balance(&payer.pubkey()))
+        .collect();
+    let mut expected_balances = vec![0; payers.len()];
+    expected_balances[0] = PAYER_LAMPORTS - TRANSFERRED_LAMPORTS;
+    expected_balances[NUM_TRANSFERS] = TRANSFERRED_LAMPORTS;
+    assert_eq!(balances, expected_balances);
 
     shutdown_flag.store(true, Ordering::Relaxed);
     assert_matches!(stage.join(), Ok(()));
@@ -460,7 +602,7 @@ fn block_with_invalid_signature_fails_verification(tampering: Tampering) {
     let mut transaction = test_bank.transfer(&recipient, 2);
 
     // The tamperings keep the number of signatures and keys valid, so the transaction passes its
-    // check and only its signature verification fails.
+    // check and executes, and only its signature verification fails.
     match tampering {
         Tampering::SignedByWrongKeypair => sign(&mut transaction, &[test_bank.payer(), &other]),
         Tampering::SignedOverOtherMessage => {
@@ -849,6 +991,157 @@ fn block_with_v1_transaction_passes_verification_only_up_to_max_accounts(
             slot: SLOT,
             bank_id: BANK_ID,
             verification_status: expected_verification_status,
+        }
+    );
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
+}
+
+#[test]
+fn block_with_transaction_failing_execution_fails_verification() {
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let test_bank = TestBank::new();
+    let stage = run_scheduler(
+        TEST_SCHEDULER_CONFIG,
+        shutdown_flag.clone(),
+        test_bank.bank_forks(),
+    );
+
+    // The blockhash is not in the bank, so the transaction cannot be committed. Its signature and
+    // its check are valid, so only its execution fails.
+    let transaction = transfer(test_bank.payer(), &Keypair::new(), 1, BOGUS_HASH);
+
+    let session: BlockVerificationSession<Started> = stage
+        .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+    submit_entries(
+        &session,
+        entry_views_for_tests(vec![next_entry(
+            &PARENT_BANK_LAST_ENTRY_HASH,
+            3,
+            vec![transaction],
+        )]),
+    );
+    let _session: BlockVerificationSession<AllEntriesSubmitted> =
+        session.notify_all_entries_submitted().unwrap();
+
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: BlockVerificationOutcome::VerificationFailed(
+                VerificationFailureReason::TransactionExecutionFailed(
+                    TransactionError::BlockhashNotFound
+                )
+            ),
+        }
+    );
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
+}
+
+// Only transactions that cannot be committed fail a block, as in replay. A transaction whose
+// instruction fails is still committed.
+#[test]
+fn block_with_transaction_failing_but_committed_passes_verification() {
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let test_bank = TestBank::new();
+    let stage = run_scheduler(
+        TEST_SCHEDULER_CONFIG,
+        shutdown_flag.clone(),
+        test_bank.bank_forks(),
+    );
+
+    // The payer cannot afford the transfer, so its instruction fails.
+    let transaction = system_transaction::transfer(
+        test_bank.payer(),
+        &Keypair::new().pubkey(),
+        PAYER_LAMPORTS + 1,
+        test_bank.recent_blockhash(),
+    );
+    let signature = transaction.signatures[0];
+
+    let session: BlockVerificationSession<Started> = stage
+        .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+    submit_entries(
+        &session,
+        entry_views_for_tests(vec![next_entry(
+            &PARENT_BANK_LAST_ENTRY_HASH,
+            3,
+            vec![transaction],
+        )]),
+    );
+    let _session: BlockVerificationSession<AllEntriesSubmitted> =
+        session.notify_all_entries_submitted().unwrap();
+
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: BlockVerificationOutcome::Verified,
+        }
+    );
+    let bank = test_bank.bank();
+    assert_matches!(
+        bank.get_signature_status(&signature),
+        Some(Err(TransactionError::InstructionError(0, _)))
+    );
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
+}
+
+#[test]
+fn block_exceeding_the_block_cost_limit_fails_verification() {
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let test_bank = TestBank::new();
+    // No transaction fits in the block.
+    test_bank
+        .bank()
+        .write_cost_tracker()
+        .unwrap()
+        .set_limits(CostTrackerLimits {
+            account_cost: u64::MAX,
+            block_cost: 0,
+            allocated_data_size: u64::MAX,
+        });
+    let stage = run_scheduler(
+        TEST_SCHEDULER_CONFIG,
+        shutdown_flag.clone(),
+        test_bank.bank_forks(),
+    );
+
+    let transaction = test_bank.transfer(&Keypair::new(), 1);
+
+    let session: BlockVerificationSession<Started> = stage
+        .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+    submit_entries(
+        &session,
+        entry_views_for_tests(vec![next_entry(
+            &PARENT_BANK_LAST_ENTRY_HASH,
+            3,
+            vec![transaction],
+        )]),
+    );
+    let _session: BlockVerificationSession<AllEntriesSubmitted> =
+        session.notify_all_entries_submitted().unwrap();
+
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: BlockVerificationOutcome::VerificationFailed(
+                VerificationFailureReason::TransactionExecutionFailed(
+                    TransactionError::WouldExceedMaxBlockCostLimit
+                )
+            ),
         }
     );
 
