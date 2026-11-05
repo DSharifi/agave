@@ -1,4 +1,4 @@
-use crate::messages::{EntryHashVerificationRequest, EntryHashVerificationResponse};
+use crate::messages::worker::{EntryHashVerificationRequest, EntryHashVerificationResponse};
 
 pub(crate) const THREAD_NAME_PREFIX: &str = "solBlkVerHash";
 

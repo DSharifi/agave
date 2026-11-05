@@ -1,0 +1,51 @@
+use {
+    agave_transaction_view::transaction_view::UnsanitizedTransactionView, bytes::Bytes,
+    solana_accounts_db::bank_id::BankId, solana_clock::Slot,
+    solana_entry::entry::EntryVerificationData, solana_hash::Hash,
+    solana_transaction_error::TransactionError,
+};
+
+#[derive(Debug)]
+pub(crate) struct EntryHashVerificationRequest {
+    pub(crate) bank_id: BankId,
+    /// The hash of the previous entry, or the parent bank's last entry hash for the first entry.
+    pub(crate) start_hash: Hash,
+    pub(crate) entry_verification_data: EntryVerificationData,
+}
+
+#[derive(Debug)]
+pub(crate) struct EntryHashVerificationResponse {
+    pub(crate) bank_id: BankId,
+    pub(crate) verified: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct SignatureVerificationRequest {
+    pub(crate) bank_id: BankId,
+    pub(crate) transaction: UnsanitizedTransactionView<Bytes>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SignatureVerificationResponse {
+    pub(crate) bank_id: BankId,
+    pub(crate) verified: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct TransactionCheckRequest {
+    pub(crate) bank_id: BankId,
+    pub(crate) slot: Slot,
+    pub(crate) transaction: UnsanitizedTransactionView<Bytes>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TransactionCheckResponse {
+    pub(crate) bank_id: BankId,
+    pub(crate) result: Result<(), TransactionCheckError>,
+}
+
+#[derive(Debug)]
+pub(crate) enum TransactionCheckError {
+    BankNotFound,
+    InvalidTransaction(TransactionError),
+}

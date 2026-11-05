@@ -1,4 +1,4 @@
-use crate::messages::{SignatureVerificationRequest, SignatureVerificationResponse};
+use crate::messages::worker::{SignatureVerificationRequest, SignatureVerificationResponse};
 
 pub(crate) const THREAD_NAME_PREFIX: &str = "solBlkVerSig";
 

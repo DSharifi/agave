@@ -46,8 +46,11 @@ use {
     crate::{
         join_thread,
         messages::{
-            AbortMessage, AllEntriesSubmittedMessage, BeginMessage,
-            BlockVerificationToReplayMessage, EntryMessage, ReplayToBlockVerificationMessage,
+            BlockVerificationToReplayMessage,
+            replay_to_scheduler::{
+                AbortMessage, AllEntriesSubmittedMessage, BeginMessage, EntryMessage,
+                ReplayToBlockVerificationMessage,
+            },
         },
         scheduler::SchedulerExitReason,
     },
