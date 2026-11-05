@@ -15,7 +15,12 @@ use {
     },
     crossbeam_channel::RecvTimeoutError,
     helpers::BANK_ID,
-    solana_accounts_db::bank_id::BankId,
+    solana_account::AccountSharedData,
+    solana_accounts_db::{account_locks::DEFAULT_TX_ACCOUNT_LOCKS, bank_id::BankId},
+    solana_address_lookup_table_interface::{
+        program as address_lookup_table_program,
+        state::{AddressLookupTable, LookupTableMeta},
+    },
     solana_clock::Slot,
     solana_entry::entry::{
         entry_views_for_tests, next_entry, next_entry_mut, next_versioned_entry,
@@ -31,6 +36,7 @@ use {
     solana_transaction_error::TransactionError,
     std::{
         assert_matches,
+        borrow::Cow,
         num::NonZeroUsize,
         sync::{
             Arc,
@@ -571,8 +577,18 @@ fn block_with_wrong_number_of_signatures_or_keys_fails_verification(tampering: C
     assert_matches!(stage.join(), Ok(()));
 }
 
-#[test]
-fn block_with_unsanitizable_transaction_fails_verification() {
+#[derive(Debug)]
+enum MessageTampering {
+    ProgramIdOutOfBounds,
+    DuplicateAccountKey,
+}
+
+#[test_case(MessageTampering::ProgramIdOutOfBounds, TransactionError::SanitizeFailure; "program_id_out_of_bounds")]
+#[test_case(MessageTampering::DuplicateAccountKey, TransactionError::AccountLoadedTwice; "duplicate_account_key")]
+fn block_with_invalid_transaction_message_fails_verification(
+    tampering: MessageTampering,
+    expected_error: TransactionError,
+) {
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let stage = run_scheduler(
         TEST_SCHEDULER_CONFIG,
@@ -580,12 +596,17 @@ fn block_with_unsanitizable_transaction_fails_verification() {
         new_bank_forks(),
     );
 
-    // The static account keys are the payer, the recipient and the system program, so the
-    // instruction invokes a program out of bounds. The payer signs the tampered message, so only
-    // the transaction check fails.
     let payer = Keypair::new();
     let mut transaction = transfer(&payer, &Keypair::new(), 1);
-    transaction.message.instructions[0].program_id_index = 3;
+    match tampering {
+        MessageTampering::ProgramIdOutOfBounds => {
+            transaction.message.instructions[0].program_id_index =
+                transaction.message.account_keys.len() as u8;
+        }
+        MessageTampering::DuplicateAccountKey => {
+            transaction.message.account_keys[1] = transaction.message.account_keys[0];
+        }
+    }
     sign(&mut transaction, &[&payer]);
 
     let session: BlockVerificationSession<Started> = stage
@@ -608,8 +629,101 @@ fn block_with_unsanitizable_transaction_fails_verification() {
             slot: SLOT,
             bank_id: BANK_ID,
             verification_status: BlockVerificationOutcome::VerificationFailed(
-                VerificationFailureReason::InvalidTransaction(TransactionError::SanitizeFailure)
+                VerificationFailureReason::InvalidTransaction(expected_error)
             ),
+        }
+    );
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
+}
+
+#[test_case(DEFAULT_TX_ACCOUNT_LOCKS, BlockVerificationOutcome::Verified; "at_limit")]
+#[test_case(
+    DEFAULT_TX_ACCOUNT_LOCKS + 1,
+    BlockVerificationOutcome::VerificationFailed(VerificationFailureReason::InvalidTransaction(
+        TransactionError::TooManyAccountLocks
+    ));
+    "over_limit"
+)]
+fn block_with_v0_transaction_passes_verification_only_up_to_account_lock_limit(
+    num_accounts: usize,
+    expected_verification_status: BlockVerificationOutcome,
+) {
+    let payer = Keypair::new();
+    let mut instruction =
+        system_instruction::transfer(&payer.pubkey(), &Keypair::new().pubkey(), 1);
+    let address_lookup_table = AddressLookupTableAccount {
+        key: Keypair::new().pubkey(),
+        addresses: (instruction.accounts.len().saturating_add(1)..num_accounts)
+            .map(|_| Keypair::new().pubkey())
+            .collect(),
+    };
+    instruction.accounts.extend(
+        address_lookup_table
+            .addresses
+            .iter()
+            .map(|address| AccountMeta::new_readonly(*address, false)),
+    );
+
+    let bank_forks = new_bank_forks();
+    let table_data = AddressLookupTable {
+        meta: LookupTableMeta::default(),
+        addresses: Cow::Borrowed(&address_lookup_table.addresses),
+    }
+    .serialize_for_tests()
+    .unwrap();
+    bank_forks
+        .read()
+        .unwrap()
+        .get(SLOT)
+        .expect("the bank at `SLOT` is in bank forks")
+        .store_account(
+            &address_lookup_table.key,
+            &AccountSharedData::new_with_data(1, table_data, &address_lookup_table_program::id()),
+        );
+
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let stage = run_scheduler(TEST_SCHEDULER_CONFIG, shutdown_flag.clone(), bank_forks);
+
+    let message = v0::Message::try_compile(
+        &payer.pubkey(),
+        &[instruction],
+        &[address_lookup_table],
+        Hash::default(),
+    )
+    .unwrap();
+    let num_loaded_accounts = message.address_table_lookups[0].readonly_indexes.len();
+    assert_eq!(
+        message
+            .account_keys
+            .len()
+            .saturating_add(num_loaded_accounts),
+        num_accounts
+    );
+    let transaction =
+        VersionedTransaction::try_new(VersionedMessage::V0(message), &[&payer]).unwrap();
+
+    let session: BlockVerificationSession<Started> = stage
+        .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+    submit_entries(
+        &session,
+        entry_views_for_tests(vec![next_versioned_entry(
+            &PARENT_BANK_LAST_ENTRY_HASH,
+            3,
+            vec![transaction],
+        )]),
+    );
+    let _session: BlockVerificationSession<AllEntriesSubmitted> =
+        session.notify_all_entries_submitted().unwrap();
+
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: expected_verification_status,
         }
     );
 
