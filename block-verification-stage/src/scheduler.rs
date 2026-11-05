@@ -2,11 +2,16 @@ use {
     crate::{
         config::SchedulerConfig,
         messages::{
-            AbortMessage, AllEntriesSubmittedMessage, BeginMessage, BlockVerificationOutcome,
-            BlockVerificationToReplayMessage, EntryHashVerificationRequest,
-            EntryHashVerificationResponse, EntryMessage, ReplayToBlockVerificationMessage,
-            SignatureVerificationRequest, SignatureVerificationResponse, TransactionCheckError,
-            TransactionCheckRequest, TransactionCheckResponse, VerificationFailureReason,
+            BlockVerificationOutcome, BlockVerificationToReplayMessage, VerificationFailureReason,
+            replay_to_scheduler::{
+                AbortMessage, AllEntriesSubmittedMessage, BeginMessage, EntryMessage,
+                ReplayToBlockVerificationMessage,
+            },
+            worker::{
+                EntryHashVerificationRequest, EntryHashVerificationResponse,
+                SignatureVerificationRequest, SignatureVerificationResponse, TransactionCheckError,
+                TransactionCheckRequest, TransactionCheckResponse,
+            },
         },
         stage::BlockVerificationStage,
         utils::ShutdownOnDrop,
