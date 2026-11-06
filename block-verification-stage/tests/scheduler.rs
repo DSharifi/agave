@@ -20,8 +20,11 @@ use {
     solana_entry::entry::{
         entry_views_for_tests, next_entry, next_entry_mut, next_versioned_entry,
     },
+    solana_hash::Hash,
     solana_keypair::Keypair,
-    solana_message::{AddressLookupTableAccount, VersionedMessage, v0},
+    solana_message::{AccountMeta, AddressLookupTableAccount, VersionedMessage, v0, v1},
+    solana_pubkey::Pubkey,
+    solana_runtime_transaction::transaction_limits::MAX_V1_ACCOUNTS,
     solana_signer::Signer,
     solana_system_interface::instruction as system_instruction,
     solana_transaction::versioned::VersionedTransaction,
@@ -668,6 +671,69 @@ fn block_with_transaction_using_missing_address_lookup_table_fails_verification(
                     TransactionError::AddressLookupTableNotFound
                 )
             ),
+        }
+    );
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
+}
+
+#[test_case(MAX_V1_ACCOUNTS, BlockVerificationOutcome::Verified; "max_accounts")]
+#[test_case(
+    MAX_V1_ACCOUNTS + 1,
+    BlockVerificationOutcome::VerificationFailed(VerificationFailureReason::InvalidTransaction(
+        TransactionError::SanitizeFailure
+    ));
+    "too_many_accounts"
+)]
+fn block_with_v1_transaction_passes_verification_only_up_to_max_accounts(
+    num_accounts: usize,
+    expected_verification_status: BlockVerificationOutcome,
+) {
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let stage = run_scheduler(
+        TEST_SCHEDULER_CONFIG,
+        shutdown_flag.clone(),
+        new_bank_forks(),
+    );
+
+    let payer = Keypair::new();
+    let mut instruction = system_instruction::transfer(&payer.pubkey(), &Pubkey::new_unique(), 1);
+    instruction.accounts.extend(
+        (instruction.accounts.len().saturating_add(1)..num_accounts)
+            .map(|_| AccountMeta::new_readonly(Pubkey::new_unique(), false)),
+    );
+    let message = v1::Message::try_compile_with_config(
+        &payer.pubkey(),
+        &[instruction],
+        Hash::default(),
+        v1::TransactionConfig::empty(),
+    )
+    .unwrap();
+    assert_eq!(message.account_keys.len(), num_accounts);
+    let transaction =
+        VersionedTransaction::try_new(VersionedMessage::V1(message), &[&payer]).unwrap();
+
+    let session: BlockVerificationSession<Started> = stage
+        .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+    submit_entries(
+        &session,
+        entry_views_for_tests(vec![next_versioned_entry(
+            &PARENT_BANK_LAST_ENTRY_HASH,
+            3,
+            vec![transaction],
+        )]),
+    );
+    let _session: BlockVerificationSession<AllEntriesSubmitted> =
+        session.notify_all_entries_submitted().unwrap();
+
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: expected_verification_status,
         }
     );
 

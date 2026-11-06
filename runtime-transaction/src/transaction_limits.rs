@@ -17,7 +17,7 @@ use {
 /// Maximum serialized transaction size for legacy and v0 transactions, in bytes.
 const MAX_LEGACY_AND_V0_TRANSACTION_SIZE: usize = 1232;
 const MAX_V1_SIGNATURES: usize = 12;
-const MAX_V1_ACCOUNTS: usize = 96;
+pub const MAX_V1_ACCOUNTS: usize = 96;
 
 pub(crate) fn validate_unique_account_keys(account_keys: AccountKeys) -> TransactionResult<()> {
     if has_duplicates(&account_keys) {

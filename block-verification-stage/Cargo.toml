@@ -30,7 +30,9 @@ solana-entry = { path = "../entry", features = ["agave-unstable-api", "dev-conte
 solana-keypair = { workspace = true }
 solana-leader-schedule = { path = "../leader-schedule", features = ["agave-unstable-api"] }
 solana-message = { workspace = true }
+solana-pubkey = { workspace = true }
 solana-runtime = { path = "../runtime", features = ["agave-unstable-api", "dev-context-only-utils"] }
+solana-runtime-transaction = { path = "../runtime-transaction", features = ["agave-unstable-api"] }
 solana-signer = { workspace = true }
 solana-system-interface = { workspace = true }
 solana-system-transaction = { workspace = true }
