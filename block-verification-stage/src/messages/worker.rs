@@ -57,12 +57,18 @@ pub(crate) enum TransactionCheckError {
 pub(crate) struct TransactionExecutionRequest {
     pub(crate) bank_id: BankId,
     pub(crate) slot: Slot,
+    /// Handed back in the response, as the scheduler tracks the requests in flight and the account
+    /// locks of each worker.
+    pub(crate) worker_index: usize,
     pub(crate) transaction: Box<ReplayTransaction>,
 }
 
 #[derive(Debug)]
 pub(crate) struct TransactionExecutionResponse {
     pub(crate) bank_id: BankId,
+    pub(crate) worker_index: usize,
+    /// Handed back so the scheduler can release the account locks of the transaction.
+    pub(crate) transaction: Box<ReplayTransaction>,
     pub(crate) result: Result<(), TransactionExecutionError>,
 }
 
