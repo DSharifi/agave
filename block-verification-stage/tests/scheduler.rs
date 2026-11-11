@@ -495,6 +495,176 @@ fn transactions_execute_in_block_order_and_are_committed_to_the_bank() {
     assert_matches!(stage.join(), Ok(()));
 }
 
+#[test]
+fn transactions_with_no_account_in_common_execute_in_parallel() {
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let test_bank = TestBank::new();
+    let bank = test_bank.bank();
+    let stage = run_scheduler(
+        TEST_SCHEDULER_CONFIG,
+        shutdown_flag.clone(),
+        test_bank.bank_forks(),
+    );
+
+    let other_payer = test_bank.new_funded_payer();
+    let transactions = vec![
+        test_bank.transfer(&Keypair::new(), 1),
+        transfer(
+            &other_payer,
+            &Keypair::new(),
+            1,
+            test_bank.recent_blockhash(),
+        ),
+    ];
+    let signatures: Vec<_> = transactions
+        .iter()
+        .map(|transaction| transaction.signatures[0])
+        .collect();
+
+    // The execution of a transaction adds its cost to the block once the transaction is committed,
+    // so holding the cost tracker of the bank keeps every committed transaction executing.
+    let cost_tracker = bank.read_cost_tracker().unwrap();
+
+    let session: BlockVerificationSession<Started> = stage
+        .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+    submit_entries(
+        &session,
+        entry_views_for_tests(vec![next_entry(
+            &PARENT_BANK_LAST_ENTRY_HASH,
+            3,
+            transactions,
+        )]),
+    );
+    let _session: BlockVerificationSession<AllEntriesSubmitted> =
+        session.notify_all_entries_submitted().unwrap();
+
+    let waiting_since = Instant::now();
+    while signatures
+        .iter()
+        .any(|signature| bank.get_signature_status(signature).is_none())
+    {
+        assert!(
+            waiting_since.elapsed() < RECV_TIMEOUT,
+            "both transactions must be committed while neither can finish executing"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    drop(cost_tracker);
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: BlockVerificationOutcome::Verified,
+        }
+    );
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
+}
+
+// A transaction held back by a conflict holds back the later transactions that conflict with it,
+// even though nothing executing conflicts with them, or they would execute before it.
+#[test]
+fn transaction_conflicting_with_a_held_back_transaction_executes_after_it() {
+    const TRANSFERRED_LAMPORTS: u64 = 1_000;
+
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let test_bank = TestBank::new();
+    let bank = test_bank.bank();
+    // A worker executing a transaction has no room for a conflicting one to wait behind it.
+    let config = SchedulerConfig {
+        num_transaction_execution_workers: NonZeroUsize::new(2).unwrap(),
+        max_transaction_executions_in_flight_per_worker: NonZeroUsize::new(1).unwrap(),
+        ..TEST_SCHEDULER_CONFIG
+    };
+    let stage = run_scheduler(config, shutdown_flag.clone(), test_bank.bank_forks());
+
+    let intermediary = Keypair::new();
+    let recipient = Keypair::new();
+    // The first transfer executes on one worker. The second one also writes the payer, so it is
+    // held back. The third is paid by the account the second one funds, so it would fail the block
+    // if executed first. The fourth, independent of the others, then executes on the other worker.
+    let first_transfer = test_bank.transfer(&Keypair::new(), 1);
+    let second_transfer = system_transaction::transfer(
+        test_bank.payer(),
+        &intermediary.pubkey(),
+        TRANSFERRED_LAMPORTS,
+        test_bank.recent_blockhash(),
+    );
+    let third_transfer = system_transaction::transfer(
+        &intermediary,
+        &recipient.pubkey(),
+        TRANSFERRED_LAMPORTS,
+        test_bank.recent_blockhash(),
+    );
+    let fourth_transfer = transfer(
+        &test_bank.new_funded_payer(),
+        &Keypair::new(),
+        1,
+        test_bank.recent_blockhash(),
+    );
+    let executing_signatures = [first_transfer.signatures[0], fourth_transfer.signatures[0]];
+    let held_back_signatures = [second_transfer.signatures[0], third_transfer.signatures[0]];
+
+    // The execution of a transaction adds its cost to the block once the transaction is committed,
+    // so holding the cost tracker of the bank keeps every committed transaction executing.
+    let cost_tracker = bank.read_cost_tracker().unwrap();
+
+    let session: BlockVerificationSession<Started> = stage
+        .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+    submit_entries(
+        &session,
+        entry_views_for_tests(vec![next_entry(
+            &PARENT_BANK_LAST_ENTRY_HASH,
+            3,
+            vec![
+                first_transfer,
+                second_transfer,
+                third_transfer,
+                fourth_transfer,
+            ],
+        )]),
+    );
+    let _session: BlockVerificationSession<AllEntriesSubmitted> =
+        session.notify_all_entries_submitted().unwrap();
+
+    let waiting_since = Instant::now();
+    while executing_signatures
+        .iter()
+        .any(|signature| bank.get_signature_status(signature).is_none())
+    {
+        assert!(
+            waiting_since.elapsed() < RECV_TIMEOUT,
+            "the first and the fourth transfers must be committed"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        held_back_signatures
+            .iter()
+            .all(|signature| bank.get_signature_status(signature).is_none()),
+        "both workers are busy, so the held back transfers cannot have executed"
+    );
+
+    drop(cost_tracker);
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: BlockVerificationOutcome::Verified,
+        }
+    );
+    assert_eq!(bank.get_balance(&recipient.pubkey()), TRANSFERRED_LAMPORTS);
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
+}
+
 #[derive(Debug)]
 enum InvalidEntry {
     /// The first entry does not follow the parent bank's last entry hash.

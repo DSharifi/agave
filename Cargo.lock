@@ -1502,7 +1502,9 @@ dependencies = [
 name = "block-verification-stage"
 version = "5.0.0-alpha.0"
 dependencies = [
+ "agave-scheduling-utils",
  "agave-transaction-view",
+ "ahash 0.8.12",
  "bytes",
  "crossbeam-channel",
  "shaq",

@@ -17,20 +17,27 @@ use {
         stage::BlockVerificationStage,
         utils::ShutdownOnDrop,
         workers::{
-            VerificationQueue, VerificationWorkers, entry_hash_verification,
+            PerWorkerQueues, VerificationQueue, VerificationWorkers, entry_hash_verification,
             signature_verification, transaction_check, transaction_execution,
         },
     },
+    agave_scheduling_utils::thread_aware_account_locks::{
+        MAX_THREADS, ThreadAwareAccountLocks, ThreadSet,
+    },
+    ahash::AHashSet,
     crossbeam_channel::{Receiver, RecvError, Sender, TrySendError, bounded, never, select},
     solana_accounts_db::bank_id::BankId,
     solana_clock::Slot,
     solana_entry::entry::EntryVerificationData,
     solana_hash::Hash,
+    solana_pubkey::Pubkey,
     solana_runtime::bank_forks::BankForks,
     solana_runtime_transaction::runtime_transaction::ReplayTransaction,
+    solana_svm_transaction::svm_message::SVMMessage,
     std::{
         collections::VecDeque,
         iter, mem,
+        num::NonZeroUsize,
         sync::{
             Arc, RwLock,
             atomic::{AtomicBool, Ordering},
@@ -44,8 +51,8 @@ type EntryHashVerificationQueue =
 type SignatureVerificationQueue =
     VerificationQueue<SignatureVerificationRequest, SignatureVerificationResponse>;
 type TransactionCheckQueue = VerificationQueue<TransactionCheckRequest, TransactionCheckResponse>;
-type TransactionExecutionQueue =
-    VerificationQueue<TransactionExecutionRequest, TransactionExecutionResponse>;
+type TransactionExecutionQueues =
+    PerWorkerQueues<TransactionExecutionRequest, TransactionExecutionResponse>;
 
 /// The timeout used on waiting for messages before checking for a timeout
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -79,12 +86,14 @@ pub(super) struct BlockVerificationScheduler {
     entry_hash_verification_queue: EntryHashVerificationQueue,
     signature_verification_queue: SignatureVerificationQueue,
     transaction_check_queue: TransactionCheckQueue,
-    transaction_execution_queue: TransactionExecutionQueue,
+    transaction_execution_queues: TransactionExecutionQueues,
 
     shutdown_signal: Arc<AtomicBool>,
     workers_shutdown_signal: ShutdownOnDrop,
 
     blocks_in_progress: Vec<BlockVerificationState>,
+    max_transactions_scanned_per_dispatch: usize,
+    unschedulable_accounts: UnschedulableAccounts,
 
     entry_hash_verification_workers: VerificationWorkers,
     signature_verification_workers: VerificationWorkers,
@@ -119,11 +128,18 @@ impl BlockVerificationScheduler {
             transaction_check_request_consumer,
             transaction_check_response_sender,
         ) = TransactionCheckQueue::new(scheduler_config.max_transaction_checks_in_flight);
+        assert!(
+            scheduler_config.num_transaction_execution_workers.get() <= MAX_THREADS,
+            "the account locks of a block track at most {MAX_THREADS} execution workers"
+        );
         let (
-            transaction_execution_queue,
-            transaction_execution_request_consumer,
+            transaction_execution_queues,
+            transaction_execution_request_consumers,
             transaction_execution_response_sender,
-        ) = TransactionExecutionQueue::new(scheduler_config.max_transaction_executions_in_flight);
+        ) = TransactionExecutionQueues::new(
+            scheduler_config.num_transaction_execution_workers,
+            scheduler_config.max_transaction_executions_in_flight_per_worker,
+        );
 
         let replay_to_block_verification =
             bounded(scheduler_config.replay_to_block_verification_channel_size);
@@ -135,24 +151,30 @@ impl BlockVerificationScheduler {
         let entry_hash_verification_workers = VerificationWorkers::spawn(
             entry_hash_verification::THREAD_NAME_PREFIX,
             workers_shutdown_signal.signal().clone(),
-            scheduler_config.num_entry_hash_workers,
-            entry_hash_verification_request_consumer,
+            vec![
+                entry_hash_verification_request_consumer;
+                scheduler_config.num_entry_hash_workers.get()
+            ],
             entry_hash_verification_response_sender,
             entry_hash_verification::verify_entry_hash,
         );
         let signature_verification_workers = VerificationWorkers::spawn(
             signature_verification::THREAD_NAME_PREFIX,
             workers_shutdown_signal.signal().clone(),
-            scheduler_config.num_signature_workers,
-            signature_verification_request_consumer,
+            vec![
+                signature_verification_request_consumer;
+                scheduler_config.num_signature_workers.get()
+            ],
             signature_verification_response_sender,
             signature_verification::verify_signatures,
         );
         let transaction_check_workers = VerificationWorkers::spawn(
             transaction_check::THREAD_NAME_PREFIX,
             workers_shutdown_signal.signal().clone(),
-            scheduler_config.num_transaction_check_workers,
-            transaction_check_request_consumer,
+            vec![
+                transaction_check_request_consumer;
+                scheduler_config.num_transaction_check_workers.get()
+            ],
             transaction_check_response_sender,
             {
                 let bank_forks = bank_forks.clone();
@@ -162,8 +184,7 @@ impl BlockVerificationScheduler {
         let transaction_execution_workers = VerificationWorkers::spawn(
             transaction_execution::THREAD_NAME_PREFIX,
             workers_shutdown_signal.signal().clone(),
-            scheduler_config.num_transaction_execution_workers,
-            transaction_execution_request_consumer,
+            transaction_execution_request_consumers,
             transaction_execution_response_sender,
             move |request| transaction_execution::execute_transaction(&bank_forks, request),
         );
@@ -174,13 +195,14 @@ impl BlockVerificationScheduler {
             entry_hash_verification_queue,
             signature_verification_queue,
             transaction_check_queue,
-            transaction_execution_queue,
+            transaction_execution_queues,
             shutdown_signal,
             workers_shutdown_signal,
             entry_hash_verification_workers,
             signature_verification_workers,
             transaction_check_workers,
             transaction_execution_workers,
+            scheduler_config.max_transactions_scanned_per_dispatch,
         );
 
         let scheduler_thread_join_handle =
@@ -200,13 +222,14 @@ impl BlockVerificationScheduler {
         entry_hash_verification_queue: EntryHashVerificationQueue,
         signature_verification_queue: SignatureVerificationQueue,
         transaction_check_queue: TransactionCheckQueue,
-        transaction_execution_queue: TransactionExecutionQueue,
+        transaction_execution_queues: TransactionExecutionQueues,
         shutdown_signal: Arc<AtomicBool>,
         workers_shutdown_signal: ShutdownOnDrop,
         entry_hash_verification_workers: VerificationWorkers,
         signature_verification_workers: VerificationWorkers,
         transaction_check_workers: VerificationWorkers,
         transaction_execution_workers: VerificationWorkers,
+        max_transactions_scanned_per_dispatch: NonZeroUsize,
     ) -> Self {
         Self {
             replay_message_receiver,
@@ -214,10 +237,12 @@ impl BlockVerificationScheduler {
             entry_hash_verification_queue,
             signature_verification_queue,
             transaction_check_queue,
-            transaction_execution_queue,
+            transaction_execution_queues,
             shutdown_signal,
             workers_shutdown_signal,
             blocks_in_progress: Vec::new(),
+            max_transactions_scanned_per_dispatch: max_transactions_scanned_per_dispatch.get(),
+            unschedulable_accounts: UnschedulableAccounts::default(),
             buffered_replay_response_messages: VecDeque::new(),
             buffered_signature_verification_requests: VecDeque::new(),
             buffered_transaction_check_requests: VecDeque::new(),
@@ -259,7 +284,7 @@ impl BlockVerificationScheduler {
                     let response = response.map_err(|_: RecvError| SchedulerExitReason::TransactionCheckWorkersExited)?;
                     let () = self.handle_transaction_check_response(response);
                 }
-                recv(self.transaction_execution_queue.response_receiver()) -> response => {
+                recv(self.transaction_execution_queues.response_receiver()) -> response => {
                     let response = response.map_err(|_: RecvError| SchedulerExitReason::TransactionExecutionWorkersExited)?;
                     let () = self.handle_transaction_execution_response(response);
                 }
@@ -276,7 +301,7 @@ impl BlockVerificationScheduler {
             entry_hash_verification_queue,
             signature_verification_queue,
             transaction_check_queue,
-            transaction_execution_queue,
+            transaction_execution_queues,
             entry_hash_verification_workers,
             signature_verification_workers,
             transaction_check_workers,
@@ -290,7 +315,7 @@ impl BlockVerificationScheduler {
         drop(entry_hash_verification_queue);
         drop(signature_verification_queue);
         drop(transaction_check_queue);
-        drop(transaction_execution_queue);
+        drop(transaction_execution_queues);
         let () = entry_hash_verification_workers.join_workers();
         let () = signature_verification_workers.join_workers();
         let () = transaction_check_workers.join_workers();
@@ -398,6 +423,7 @@ impl BlockVerificationScheduler {
             bank_id,
             parent_bank_last_entry_hash,
             slot,
+            self.transaction_execution_queues.num_workers(),
         ));
     }
 
@@ -625,14 +651,24 @@ impl BlockVerificationScheduler {
 
     fn handle_transaction_execution_response(
         &mut self,
-        TransactionExecutionResponse { bank_id, result }: TransactionExecutionResponse,
+        TransactionExecutionResponse {
+            bank_id,
+            worker_index,
+            transaction,
+            result,
+        }: TransactionExecutionResponse,
     ) {
-        self.transaction_execution_queue.complete_request();
+        self.transaction_execution_queues
+            .complete_request(worker_index);
 
         let block_verification_state = self.block_verification_state_mut(bank_id).expect(
             "the block verification exists, as it's released only if there are no worker requests \
              in flight",
         );
+
+        block_verification_state
+            .account_locks
+            .unlock_accounts(transaction_account_locks(&transaction), worker_index);
 
         let progress_tracker = &mut block_verification_state.progress_tracker;
 
@@ -654,47 +690,133 @@ impl BlockVerificationScheduler {
             };
         }
 
-        // The response frees room in the request queue, which any block may be waiting for.
+        // The response frees room on the worker and the accounts of the transaction, which other
+        // transactions may be waiting for.
         self.dispatch_transaction_executions();
     }
 
+    /// Sends the checked transactions of the blocks in progress for execution while workers have
+    /// room, favouring the blocks that arrived first, and scanning each block in order from its
+    /// first transaction not yet sent.
+    ///
+    /// The scan of a block stops at its first transaction not yet checked, as its accounts are
+    /// unknown. A transaction is sent once its accounts can be locked, possibly to a worker
+    /// executing a conflicting transaction, which then executes them in order. A transaction held
+    /// back holds back the later ones conflicting with it, so conflicting transactions execute in
+    /// block order.
     fn dispatch_transaction_executions(&mut self) {
+        let mut workers_with_room = ThreadSet::none();
+        for worker_index in 0..self.transaction_execution_queues.num_workers() {
+            if self
+                .transaction_execution_queues
+                .can_send_request(worker_index)
+            {
+                workers_with_room.insert(worker_index);
+            }
+        }
+
         for block_verification_state in &mut self.blocks_in_progress {
-            if !self.transaction_execution_queue.can_send_request() {
+            if workers_with_room.is_empty() {
                 return;
             }
-
-            let progress_tracker = &mut block_verification_state.progress_tracker;
-            if block_verification_state.tracking_state != BlockTrackingState::InProgress
-                || progress_tracker.transaction_execution_jobs_pending > 0
-            {
+            if block_verification_state.tracking_state != BlockTrackingState::InProgress {
                 continue;
             }
 
-            let Some(transaction) = block_verification_state
-                .transaction_execution_states
-                .get_mut(block_verification_state.next_transaction_index_to_execute)
-                .and_then(TransactionExecutionState::take_for_execution)
-            else {
-                continue;
-            };
+            self.unschedulable_accounts.clear();
+            let mut num_transactions_scanned: usize = 0;
+            let first_transaction_index_not_sent =
+                block_verification_state.next_transaction_index_to_execute;
 
-            block_verification_state.next_transaction_index_to_execute = block_verification_state
-                .next_transaction_index_to_execute
-                .checked_add(1)
-                .expect("the transaction indices of a block are bounded by the size of a block");
+            for transaction_execution_state in &mut block_verification_state
+                .transaction_execution_states[first_transaction_index_not_sent..]
+            {
+                if workers_with_room.is_empty()
+                    || num_transactions_scanned == self.max_transactions_scanned_per_dispatch
+                {
+                    break;
+                }
 
-            progress_tracker.transaction_execution_jobs_pending = progress_tracker
-                .transaction_execution_jobs_pending
-                .checked_add(1)
-                .expect("number of transactions executed in flight is bounded");
+                let transaction = match mem::replace(
+                    transaction_execution_state,
+                    TransactionExecutionState::SentForExecution,
+                ) {
+                    TransactionExecutionState::AwaitingCheck => {
+                        *transaction_execution_state = TransactionExecutionState::AwaitingCheck;
+                        break;
+                    }
+                    TransactionExecutionState::Checked(transaction) => transaction,
+                    TransactionExecutionState::SentForExecution => continue,
+                };
+                num_transactions_scanned = num_transactions_scanned
+                    .checked_add(1)
+                    .expect("the transactions scanned are bounded by the scan limit");
 
-            self.transaction_execution_queue
-                .send(TransactionExecutionRequest {
-                    bank_id: block_verification_state.bank_id,
-                    slot: block_verification_state.slot,
-                    transaction,
-                });
+                let conflicts_with_held_back_transaction =
+                    self.unschedulable_accounts.conflicts_with(&transaction);
+                let locked_worker_index = if conflicts_with_held_back_transaction {
+                    None
+                } else {
+                    block_verification_state
+                        .account_locks
+                        .try_lock_accounts(
+                            transaction_account_locks(&transaction),
+                            workers_with_room,
+                            |schedulable_workers| {
+                                schedulable_workers
+                                    .contained_threads_iter()
+                                    .min_by_key(|&worker_index| {
+                                        self.transaction_execution_queues
+                                            .requests_in_flight(worker_index)
+                                    })
+                                    .expect(
+                                        "the account locks only select from a non-empty set of \
+                                         workers",
+                                    )
+                            },
+                        )
+                        .ok()
+                };
+                let Some(worker_index) = locked_worker_index else {
+                    self.unschedulable_accounts.insert(&transaction);
+                    *transaction_execution_state = TransactionExecutionState::Checked(transaction);
+                    continue;
+                };
+
+                let progress_tracker = &mut block_verification_state.progress_tracker;
+                progress_tracker.transaction_execution_jobs_pending = progress_tracker
+                    .transaction_execution_jobs_pending
+                    .checked_add(1)
+                    .expect("number of transactions executed in flight is bounded");
+
+                self.transaction_execution_queues.send(
+                    worker_index,
+                    TransactionExecutionRequest {
+                        bank_id: block_verification_state.bank_id,
+                        slot: block_verification_state.slot,
+                        worker_index,
+                        transaction,
+                    },
+                );
+                if !self
+                    .transaction_execution_queues
+                    .can_send_request(worker_index)
+                {
+                    workers_with_room.remove(worker_index);
+                }
+            }
+
+            let num_transactions_sent_in_order = block_verification_state
+                .transaction_execution_states[first_transaction_index_not_sent..]
+                .iter()
+                .take_while(|state| matches!(state, TransactionExecutionState::SentForExecution))
+                .count();
+            block_verification_state.next_transaction_index_to_execute =
+                first_transaction_index_not_sent
+                    .checked_add(num_transactions_sent_in_order)
+                    .expect(
+                        "the transaction indices of a block are bounded by the size of a block",
+                    );
         }
     }
 
@@ -715,11 +837,21 @@ struct BlockVerificationState {
     tracking_state: BlockTrackingState,
     progress_tracker: BlockVerificationStatus,
     transaction_execution_states: Vec<TransactionExecutionState>,
+    /// Every transaction before this index has been sent for execution.
     next_transaction_index_to_execute: usize,
+    /// The accounts of the transactions executing. Blocks verified at the same time are on
+    /// different forks, as a bank is created only once its parent is frozen, so the transactions
+    /// of different blocks never conflict.
+    account_locks: ThreadAwareAccountLocks,
 }
 
 impl BlockVerificationState {
-    fn new(bank_id: BankId, parent_bank_last_entry_hash: Hash, slot: Slot) -> Self {
+    fn new(
+        bank_id: BankId,
+        parent_bank_last_entry_hash: Hash,
+        slot: Slot,
+        num_execution_workers: usize,
+    ) -> Self {
         Self {
             bank_id,
             last_entry_hash: parent_bank_last_entry_hash,
@@ -728,6 +860,7 @@ impl BlockVerificationState {
             progress_tracker: BlockVerificationStatus::default(),
             transaction_execution_states: Vec::new(),
             next_transaction_index_to_execute: 0,
+            account_locks: ThreadAwareAccountLocks::new(num_execution_workers),
         }
     }
 
@@ -766,16 +899,45 @@ enum TransactionExecutionState {
     SentForExecution,
 }
 
-impl TransactionExecutionState {
-    fn take_for_execution(&mut self) -> Option<Box<ReplayTransaction>> {
-        match mem::replace(self, Self::SentForExecution) {
-            Self::Checked(transaction) => Some(transaction),
-            state => {
-                *self = state;
-                None
+/// The accounts of the transactions a dispatch holds back, which the later transactions of the
+/// block must not conflict with, or they would execute before an earlier conflicting one.
+#[derive(Default)]
+struct UnschedulableAccounts {
+    read: AHashSet<Pubkey>,
+    written: AHashSet<Pubkey>,
+}
+
+impl UnschedulableAccounts {
+    fn clear(&mut self) {
+        self.read.clear();
+        self.written.clear();
+    }
+
+    fn conflicts_with(&self, transaction: &ReplayTransaction) -> bool {
+        transaction_account_locks(transaction).any(|(account, is_writable)| {
+            self.written.contains(account) || (is_writable && self.read.contains(account))
+        })
+    }
+
+    fn insert(&mut self, transaction: &ReplayTransaction) {
+        for (account, is_writable) in transaction_account_locks(transaction) {
+            if is_writable {
+                self.written.insert(*account);
+            } else {
+                self.read.insert(*account);
             }
         }
     }
+}
+
+fn transaction_account_locks(
+    transaction: &ReplayTransaction,
+) -> impl Iterator<Item = (&Pubkey, bool)> + Clone {
+    transaction
+        .account_keys()
+        .iter()
+        .enumerate()
+        .map(|(index, account)| (account, transaction.is_writable(index)))
 }
 
 #[derive(Debug)]
@@ -805,11 +967,12 @@ mod tests {
         super::*,
         bytes::Bytes,
         crossbeam_channel::TryRecvError,
-        shaq::mpmc,
+        shaq::{mpmc, spsc},
         solana_entry::entry::{Entry, EntryView, entry_views_for_tests, next_entry},
         solana_keypair::Keypair,
         solana_runtime::bank::Bank,
         solana_signer::Signer,
+        solana_svm_transaction::svm_transaction::SVMStaticTransaction,
         solana_system_transaction as system_transaction,
         solana_transaction::TransactionVerificationMode,
         std::num::NonZeroUsize,
@@ -822,7 +985,9 @@ mod tests {
     const ENTRY_HASH_VERIFICATION_QUEUE_SIZE: usize = 8;
     const SIGNATURE_VERIFICATION_QUEUE_SIZE: usize = 4;
     const TRANSACTION_CHECK_QUEUE_SIZE: usize = 6;
+    const NUM_TRANSACTION_EXECUTION_WORKERS: usize = 2;
     const TRANSACTION_EXECUTION_QUEUE_SIZE: usize = 2;
+    const MAX_TRANSACTIONS_SCANNED_PER_DISPATCH: usize = 8;
     const OUTCOME_CHANNEL_SIZE: usize = 64;
 
     /// Flushes the completed blocks after every handler call, like the event loop.
@@ -831,7 +996,7 @@ mod tests {
         entry_hash_verification_request_consumer: mpmc::Consumer<EntryHashVerificationRequest>,
         signature_verification_request_consumer: mpmc::Consumer<SignatureVerificationRequest>,
         transaction_check_request_consumer: mpmc::Consumer<TransactionCheckRequest>,
-        transaction_execution_request_consumer: mpmc::Consumer<TransactionExecutionRequest>,
+        transaction_execution_request_consumers: Vec<spsc::Consumer<TransactionExecutionRequest>>,
         outcome_receiver: Receiver<BlockVerificationToReplayMessage>,
     }
 
@@ -849,8 +1014,9 @@ mod tests {
                 );
             let (transaction_check_queue, transaction_check_request_consumer, _) =
                 VerificationQueue::new(NonZeroUsize::new(TRANSACTION_CHECK_QUEUE_SIZE).unwrap());
-            let (transaction_execution_queue, transaction_execution_request_consumer, _) =
-                VerificationQueue::new(
+            let (transaction_execution_queues, transaction_execution_request_consumers, _) =
+                PerWorkerQueues::new(
+                    NonZeroUsize::new(NUM_TRANSACTION_EXECUTION_WORKERS).unwrap(),
                     NonZeroUsize::new(TRANSACTION_EXECUTION_QUEUE_SIZE).unwrap(),
                 );
             let (outcome_sender, outcome_receiver) = bounded(OUTCOME_CHANNEL_SIZE);
@@ -862,13 +1028,14 @@ mod tests {
                 entry_hash_verification_queue,
                 signature_verification_queue,
                 transaction_check_queue,
-                transaction_execution_queue,
+                transaction_execution_queues,
                 Arc::new(AtomicBool::new(false)),
                 ShutdownOnDrop::from(Arc::new(AtomicBool::new(false))),
                 VerificationWorkers::none(),
                 VerificationWorkers::none(),
                 VerificationWorkers::none(),
                 VerificationWorkers::none(),
+                NonZeroUsize::new(MAX_TRANSACTIONS_SCANNED_PER_DISPATCH).unwrap(),
             );
 
             Self {
@@ -876,7 +1043,7 @@ mod tests {
                 entry_hash_verification_request_consumer,
                 signature_verification_request_consumer,
                 transaction_check_request_consumer,
-                transaction_execution_request_consumer,
+                transaction_execution_request_consumers,
                 outcome_receiver,
             }
         }
@@ -953,6 +1120,11 @@ mod tests {
                 .transaction_check_request_consumer
                 .try_read()
                 .expect("tests only respond to requests the scheduler sent");
+            self.respond_to_transaction_check(request);
+        }
+
+        /// Answers the request as passing the check
+        fn respond_to_transaction_check(&mut self, request: TransactionCheckRequest) {
             let transaction = Bank::default_for_tests()
                 .verify_transaction(request.transaction, TransactionVerificationMode::HashOnly)
                 .expect("the tests only submit transactions that pass the check");
@@ -965,15 +1137,20 @@ mod tests {
             self.scheduler.try_flush_completed_blocks().unwrap();
         }
 
-        /// Answers the oldest request in the queue
-        fn respond_transaction_execution(&mut self, result: Result<(), TransactionExecutionError>) {
-            let request = self
-                .transaction_execution_request_consumer
+        /// Answers the oldest request in the queue of the worker
+        fn respond_transaction_execution(
+            &mut self,
+            worker_index: usize,
+            result: Result<(), TransactionExecutionError>,
+        ) {
+            let request = self.transaction_execution_request_consumers[worker_index]
                 .try_read()
                 .expect("tests only respond to requests the scheduler sent");
             self.scheduler
                 .handle_transaction_execution_response(TransactionExecutionResponse {
                     bank_id: request.bank_id,
+                    worker_index: request.worker_index,
+                    transaction: request.transaction,
                     result,
                 });
             self.scheduler.try_flush_completed_blocks().unwrap();
@@ -1003,6 +1180,12 @@ mod tests {
 
         fn transaction_check_requests_in_flight(&self) -> usize {
             self.scheduler.transaction_check_queue.requests_in_flight()
+        }
+
+        fn transaction_execution_requests_in_flight(&self, worker_index: usize) -> usize {
+            self.scheduler
+                .transaction_execution_queues
+                .requests_in_flight(worker_index)
         }
     }
 
@@ -1203,7 +1386,7 @@ mod tests {
         scheduler.respond_entry_hash(true);
         scheduler.respond_entry_hash(true);
         scheduler.respond_transaction_check();
-        scheduler.respond_transaction_execution(Ok(()));
+        scheduler.respond_transaction_execution(0, Ok(()));
 
         scheduler.notify_all_entries_submitted(BANK_ID);
         assert_eq!(
@@ -1313,7 +1496,7 @@ mod tests {
             "a block must not complete while its transactions are executing"
         );
 
-        scheduler.respond_transaction_execution(Ok(()));
+        scheduler.respond_transaction_execution(0, Ok(()));
         assert_eq!(
             scheduler.try_recv_outcome(),
             Some(BlockVerificationToReplayMessage {
@@ -1363,5 +1546,97 @@ mod tests {
 
         // The freed room can be used, so the next entry is sent without the queue overflowing.
         scheduler.submit_entries(BANK_ID, arbitrary_entries_with_a_transaction(1));
+    }
+
+    #[test]
+    fn transaction_conflicting_with_an_executing_one_is_queued_behind_it_on_its_worker() {
+        let mut scheduler = ManuallyDrivenScheduler::new();
+
+        let payer = Keypair::new();
+        let transactions = vec![
+            system_transaction::transfer(&payer, &Pubkey::new_unique(), 1, Hash::default()),
+            system_transaction::transfer(&payer, &Pubkey::new_unique(), 1, Hash::default()),
+        ];
+        let signatures_in_block_order =
+            [transactions[0].signatures[0], transactions[1].signatures[0]];
+
+        scheduler.begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH);
+        scheduler.submit_entries(
+            BANK_ID,
+            entry_views_for_tests(vec![next_entry(&Hash::default(), 1, transactions)]),
+        );
+        scheduler.respond_transaction_check();
+        scheduler.respond_transaction_check();
+
+        assert_eq!(
+            (
+                scheduler.transaction_execution_requests_in_flight(0),
+                scheduler.transaction_execution_requests_in_flight(1),
+            ),
+            (2, 0),
+            "both transfers write the payer, so the second one must execute on the worker of the \
+             first one"
+        );
+        let worker_requests = &mut scheduler.transaction_execution_request_consumers[0];
+        assert_eq!(
+            [worker_requests.try_read(), worker_requests.try_read()]
+                .map(|request| *request.unwrap().transaction.signature()),
+            signatures_in_block_order
+        );
+    }
+
+    #[test]
+    fn transaction_is_not_sent_for_execution_before_the_earlier_ones_are_checked() {
+        let mut scheduler = ManuallyDrivenScheduler::new();
+
+        // The transfers have no account in common.
+        let transactions = vec![
+            system_transaction::transfer(
+                &Keypair::new(),
+                &Pubkey::new_unique(),
+                1,
+                Hash::default(),
+            ),
+            system_transaction::transfer(
+                &Keypair::new(),
+                &Pubkey::new_unique(),
+                1,
+                Hash::default(),
+            ),
+        ];
+
+        scheduler.begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH);
+        scheduler.submit_entries(
+            BANK_ID,
+            entry_views_for_tests(vec![next_entry(&Hash::default(), 1, transactions)]),
+        );
+        let first_request = scheduler
+            .transaction_check_request_consumer
+            .try_read()
+            .unwrap();
+        let second_request = scheduler
+            .transaction_check_request_consumer
+            .try_read()
+            .unwrap();
+
+        scheduler.respond_to_transaction_check(second_request);
+        assert_eq!(
+            (
+                scheduler.transaction_execution_requests_in_flight(0),
+                scheduler.transaction_execution_requests_in_flight(1),
+            ),
+            (0, 0),
+            "the accounts of the first transfer are unknown until it is checked, so the second \
+             one must wait for its check"
+        );
+
+        scheduler.respond_to_transaction_check(first_request);
+        assert_eq!(
+            (
+                scheduler.transaction_execution_requests_in_flight(0),
+                scheduler.transaction_execution_requests_in_flight(1),
+            ),
+            (1, 1)
+        );
     }
 }

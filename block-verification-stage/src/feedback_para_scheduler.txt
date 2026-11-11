@@ -1,0 +1,9 @@
+- Can we avoid the unreachable! arms that are potential panic footguns? For example instead of one deqvec
+we could have a vector for each state. Could be problematic due to the indexing.
+- Why have the while loop to eagerly drain, in handle_transaction_check_responses, instead
+of waiting for next select! iteration?
+- Never do small wrappers like `least_busy_worker` which has only one call site. It doesn't save anything. `send_for_execution` is "fine" but not ideal
+since it's larger in scope and reduces nested code at the call site.
+- Not a big fan of the scheduling logic being inside an impl of BlockVerificationState, `dispatch_transaction_executions`. Is this a pattern you saw somewhere else?
+- Can we not make `PerWorkerQueues` a type state pattern over the existing queue and have separate impl blocks on the concrete variant? Maybe the current variant makes sense
+but it looks like a lot of duplication. I understand if it's unavoidable.
