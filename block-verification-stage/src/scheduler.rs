@@ -824,7 +824,7 @@ mod tests {
     const ENTRY_HASH_VERIFICATION_QUEUE_SIZE: usize = 8;
     const SIGNATURE_VERIFICATION_QUEUE_SIZE: usize = 4;
     const TRANSACTION_CHECK_QUEUE_SIZE: usize = 6;
-    const TRANSACTION_EXECUTION_QUEUE_SIZE: usize = 2;
+    const TRANSACTION_EXECUTION_QUEUE_SIZE: NonZeroUsize = NonZeroUsize::new(2).unwrap();
     const OUTCOME_CHANNEL_SIZE: usize = 64;
 
     /// Flushes the completed blocks after every handler call, like the event loop.
@@ -852,9 +852,7 @@ mod tests {
             let (transaction_check_queue, transaction_check_request_consumer, _) =
                 VerificationQueue::new(NonZeroUsize::new(TRANSACTION_CHECK_QUEUE_SIZE).unwrap());
             let (transaction_execution_queue, transaction_execution_request_consumer, _) =
-                VerificationQueue::new(
-                    NonZeroUsize::new(TRANSACTION_EXECUTION_QUEUE_SIZE).unwrap(),
-                );
+                VerificationQueue::new(TRANSACTION_EXECUTION_QUEUE_SIZE);
             let (outcome_sender, outcome_receiver) = bounded(OUTCOME_CHANNEL_SIZE);
             let message_receiver = never();
 
