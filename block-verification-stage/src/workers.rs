@@ -101,9 +101,9 @@ impl<Request: Send + Debug, Response> VerificationQueue<Request, Response> {
 
 /// Like [`VerificationQueue`], but with a request queue for each worker.
 pub(crate) struct PerWorkerQueues<Request, Response> {
-    request_producers: Vec<spsc::Producer<Request>>,
+    request_producers: Box<[spsc::Producer<Request>]>,
     response_receiver: Receiver<Response>,
-    requests_in_flight: Vec<usize>,
+    requests_in_flight: Box<[usize]>,
     queue_size: usize,
 }
 
@@ -112,8 +112,8 @@ impl<Request: Send + Debug, Response> PerWorkerQueues<Request, Response> {
     pub(crate) fn new(
         num_workers: NonZeroUsize,
         queue_size: NonZeroUsize,
-    ) -> (Self, Vec<spsc::Consumer<Request>>, Sender<Response>) {
-        let (request_producers, request_consumers) = (0..num_workers.get())
+    ) -> (Self, Box<[spsc::Consumer<Request>]>, Sender<Response>) {
+        let (request_producers, request_consumers): (Vec<_>, Vec<_>) = (0..num_workers.get())
             .map(|_| {
                 spsc::pair(queue_size.get())
                     .expect("spsc shaq channel can be allocated with the config")
@@ -125,13 +125,17 @@ impl<Request: Send + Debug, Response> PerWorkerQueues<Request, Response> {
         let (response_sender, response_receiver) = bounded(max_requests_in_flight.get());
 
         let per_worker_queues = Self {
-            request_producers,
+            request_producers: request_producers.into_boxed_slice(),
             response_receiver,
-            requests_in_flight: vec![0; num_workers.get()],
+            requests_in_flight: vec![0; num_workers.get()].into_boxed_slice(),
             queue_size: queue_size.get(),
         };
 
-        (per_worker_queues, request_consumers, response_sender)
+        (
+            per_worker_queues,
+            request_consumers.into_boxed_slice(),
+            response_sender,
+        )
     }
 
     pub(crate) fn num_workers(&self) -> usize {
@@ -217,7 +221,7 @@ impl VerificationWorkers {
     pub(crate) fn spawn_per_consumer<Request: Send + 'static, Response: Send + 'static>(
         thread_name_prefix: &str,
         shutdown_signal: Arc<AtomicBool>,
-        request_consumers: Vec<spsc::Consumer<Request>>,
+        request_consumers: Box<[spsc::Consumer<Request>]>,
         response_sender: Sender<Response>,
         verify: impl Fn(Request) -> Response + Clone + Send + 'static,
     ) -> Self {

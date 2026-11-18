@@ -853,7 +853,7 @@ mod tests {
         entry_hash_verification_request_consumer: mpmc::Consumer<EntryHashVerificationRequest>,
         signature_verification_request_consumer: mpmc::Consumer<SignatureVerificationRequest>,
         transaction_check_request_consumer: mpmc::Consumer<TransactionCheckRequest>,
-        transaction_execution_request_consumers: Vec<spsc::Consumer<TransactionExecutionRequest>>,
+        transaction_execution_request_consumers: Box<[spsc::Consumer<TransactionExecutionRequest>]>,
         outcome_receiver: Receiver<BlockVerificationToReplayMessage>,
     }
 
